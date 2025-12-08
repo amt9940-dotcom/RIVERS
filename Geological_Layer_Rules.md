@@ -5,11 +5,13 @@
 
 ## Table of Contents
 1. [Topographic Region Classification](#topographic-region-classification)
-2. [Surface Parameter Rules](#surface-parameter-rules)
-3. [Layer-Specific Rules by Region](#layer-specific-rules-by-region)
-4. [Layer Relationship Rules](#layer-relationship-rules)
-5. [Thickness Constraints](#thickness-constraints)
-6. [Implementation Guidelines](#implementation-guidelines)
+2. [Classification System](#classification-system)
+3. [Surface Parameter Rules](#surface-parameter-rules)
+4. [Explicit Parameter Rules by Layer Family](#explicit-parameter-rules-by-layer-family)
+5. [Layer-Specific Rules by Region](#layer-specific-rules-by-region)
+6. [Layer Relationship Rules](#layer-relationship-rules)
+7. [Thickness Constraints](#thickness-constraints)
+8. [Implementation Guidelines](#implementation-guidelines)
 
 ---
 
@@ -86,9 +88,69 @@ The terrain is classified into distinct geomorphic zones, each with characterist
 
 ---
 
-## 2. Surface Parameter Rules
+## 2. Classification System
 
-### 2.1 Elevation-Based Rules
+### 2.1 Elevation and Slope Classification
+
+**Elevation Normalization:**
+```
+E_rel = (z - z_min) / (z_max - z_min)   # 0 = global low, 1 = global high
+```
+
+**Elevation Classes:**
+- **LOW:** E_rel < 0.3
+- **MID:** 0.3 ≤ E_rel ≤ 0.7
+- **HIGH:** E_rel > 0.7
+
+**Slope Classes (S_deg = slope in degrees):**
+- **FLAT:** S_deg < 3°
+- **GENTLE:** 3° ≤ S_deg < 8°
+- **MODERATE:** 8° ≤ S_deg ≤ 25°
+- **STEEP:** S_deg > 25°
+
+### 2.2 Regional Classification
+
+**Region Types** (computed in large window, e.g., 5-10% of map width):
+
+- **UPLAND:**
+  - Mean E_rel > 0.6
+  - Mean S_deg > 10°
+  - High relief, rugged terrain
+
+- **BASIN:**
+  - Mean E_rel < 0.4
+  - Mean S_deg < 8°
+  - Low relief, depositional environment
+
+- **PLATFORM:**
+  - 0.4 ≤ Mean E_rel ≤ 0.6
+  - Mean S_deg < 4°
+  - Low relief, broad areas
+
+- **FOOTHILL:**
+  - Transitional between UPLAND and BASIN
+  - Mean S_deg 8-20°
+  - Moderate relief
+
+### 2.3 "Not in Mountains" Enforcement Rule
+
+**Core Principle:** For lithologies that "don't belong in mountains":
+
+For cells with `region_type = UPLAND` AND `E_rel > 0.7`:
+- Set deposition probability = 0 for that lithology
+- Only allow at depth if pre-existing older layers put it there
+- Do NOT add it as a new package near the surface
+
+**Examples:**
+- Evaporite, Limestone, Dolomite, fine mudstones: Deposition allowed only in BASIN/PLATFORM, and E_rel < 0.6
+- Thick sandstones: Deposition only where region_type ≠ UPLAND, and S_deg < 10°
+- Conglomerate: Deposition only where region_type is FOOTHILL/UPLAND edge, not deep BASIN or high ridge crest
+
+---
+
+## 3. Surface Parameter Rules
+
+### 3.1 Elevation-Based Rules
 
 | Elevation Zone | Regolith Thickness | Sedimentary Cover | Basement Exposure |
 |---------------|---------------------|-------------------|-------------------|
@@ -152,7 +214,358 @@ The terrain is classified into distinct geomorphic zones, each with characterist
 
 ---
 
-## 3. Layer-Specific Rules by Region
+## 4. Explicit Parameter Rules by Layer Family
+
+**Note:** The thickness ranges and parameter thresholds below are **implementation parameters for the generator**, not universal geologic laws. They provide concrete, testable rules for where each layer can exist and how thick it can be, based on local and regional topographic conditions.
+
+Each layer family includes:
+- **Thickness ranges** (min-max for the generator)
+- **Where it is allowed** (based on local elevation, slope, and regional classification)
+- **Explicit rules** (deposition masks and suppression conditions)
+
+### 4.1 Basement & Crystalline Rocks
+
+**Layers:** BasementFloor, Basement, AncientCrust, Gneiss, Granite
+
+#### Thickness Ranges
+- **Basement stack (all together):** 500-3000 m visible
+- **Individual subdivision:** Variable, but total basement stack is effectively "infinite" for modeling purposes
+- **Note:** Real basins have sedimentary shells ~1-10+ km thick over basement; average sedimentary shell on continents is ~1.8 km
+
+#### Where They Exist
+- **Always:** Form the lowest units everywhere
+- **Surface exposure:** Only where erosion has stripped cover
+  - Preferentially in **UPLAND** regions with **HIGH** elevation (E_rel > 0.7) and **STEEP/MODERATE** slopes (S_deg > 8°)
+  - Should NOT create new basement at shallow depth in low basins
+
+#### Rules
+1. Basement always fills from the bottom up until other layers are added
+2. At cells where total cover thickness ≤ 0 → surface lithology = one of these crystalline units
+3. **Do NOT tie basement geometry to detailed surface roughness** - use a smooth regional structural surface
+4. Basement exposure mask: `(region_type == UPLAND) AND (E_rel > 0.7) AND (S_deg > 8°)`
+
+---
+
+### 4.2 Basalt
+
+**Layer:** Basalt (volcanic flows or plateau basalts)
+
+#### Thickness Ranges
+- **Single basalt package:** 10-100 m typical
+- **Thick stack:** Up to 200-300 m (real flood basalts can be >1 km, but that's overkill for model)
+- **Minimum:** 5 m
+
+#### Where They Exist
+- Can occur in both uplands and basins
+- Common as relatively flat-lying flow tops or plateau caps
+- Not tied strongly to current slope (treat as older event)
+
+#### Rules
+1. Allow basalt only where S_deg (paleo-slope) was **GENTLE** or **FLAT** when emplaced (S_deg < 8°)
+2. In **UPLAND** regions, let basalt form flat caps on highs (good for mesa/plateau feel)
+3. **Do NOT let basalt be a thin noisy ribbon under every cell** - it should be present in belts/patches, not everywhere
+4. Deposition mask: `(S_deg < 8°) AND (region_type ∈ {UPLAND, BASIN, PLATFORM})`
+5. Spatial clustering: Use patchy distribution, not uniform
+
+---
+
+### 4.3 Carbonates & Evaporites
+
+#### Limestone
+
+**Thickness Ranges:**
+- **Individual formations:** 10-100 m per layer
+- **Stacked packages:** Can total several hundred meters
+- **Minimum:** 5 m
+- **Maximum:** 350 m (in thick platform successions)
+
+**Where They Exist:**
+- **PLATFORM** regions: low relief, mean slope small
+- Elevation near "sea level": **MID** elevation band (0.3 ≤ E_rel ≤ 0.7)
+- Local slopes mostly **FLAT-GENTLE** (S_deg < 5°)
+
+**Rules:**
+1. Only deposit limestone where:
+   - `region_type ∈ {PLATFORM, BASIN with very low relief}`
+   - `S_deg < 5°`
+   - `0.3 ≤ E_rel ≤ 0.7`
+2. In **UPLANDs / HIGH E_rel (E_rel > 0.7):** Do NOT deposit new limestone
+3. Limestone there, if any, should be older units that have been uplifted/eroded into view, not fresh platforms on steep mountains
+4. Deposition mask: `(region_type ∈ {PLATFORM, BASIN}) AND (S_deg < 5°) AND (0.3 ≤ E_rel ≤ 0.7) AND (region_type ≠ UPLAND)`
+5. Suppression mask: `(region_type == UPLAND) OR (E_rel > 0.7) OR (S_deg > 10°)` → weight = 0
+
+#### Dolomite
+
+**Thickness Ranges:**
+- **Per layer:** 5-100 m (same order as limestone)
+- **Stacked:** Can total 100-200 m
+- **Minimum:** 3 m
+
+**Where They Exist:**
+- Same environments as limestone, maybe slightly more restricted to inner/platform or restricted settings
+- **MID** elevation (0.3 ≤ E_rel ≤ 0.7)
+- **FLAT-GENTLE** slopes (S_deg < 5°)
+
+**Rules:**
+1. Only allowed where limestone is allowed
+2. Optionally bias dolomite toward more interior / slightly higher E_rel within platforms, but still not in steep mountains
+3. Deposition mask: Same as limestone, with optional E_rel bias toward 0.5-0.7
+4. Suppression: Same as limestone
+
+#### Evaporite
+
+**Thickness Ranges:**
+- **Single layer:** 10-200 m
+- **Real evaporite sequences:** Can be 10s to 1000s of meters in large basins
+- **Minimum:** 5 m
+- **Maximum:** 200 m (thickest at basin center)
+
+**Where They Exist:**
+- Only in **BASIN** regions that are hydrologically closed:
+  - **LOW** elevation (E_rel < 0.3, bottom 20-30%)
+  - Very low slope (**FLAT-GENTLE**, S_deg < 3°)
+  - Ideally near centers of topographic depressions
+
+**Rules:**
+1. Require:
+   - `E_rel < 0.3`
+   - `S_deg < 3°`
+   - `region_type == BASIN`
+   - Plus "closed-basin mask" (topographic depression)
+2. **Never allow evaporite deposition in UPLAND / HIGH elevation regions**
+3. Thickness maximum at basin center; taper to zero at basin margins
+4. Deposition mask: `(region_type == BASIN) AND (E_rel < 0.3) AND (S_deg < 3°) AND (closed_basin_mask == True)`
+5. Suppression: `(region_type == UPLAND) OR (E_rel > 0.3) OR (S_deg > 3°)` → weight = 0
+
+---
+
+### 4.4 Clastic Sedimentary Rocks
+
+#### Sandstone
+
+**Thickness Ranges:**
+- **Per layer:** 5-150 m
+- **Single formations:** Commonly 10-200 m
+- **Stacked packages:** Can total >1 km
+- **Minimum:** 3 m
+- **Maximum:** 300 m (regional variation)
+
+**Where They Exist:**
+- Deposits in rivers, deltas, shorelines, eolian dunes
+- Mainly where local slope is **low to moderate** (S_deg < 10-12°)
+- Thickest in **BASIN** and **PLATFORM** regions
+- Scarce as new deposits in rugged uplands
+
+**Rules:**
+1. For deposition, allow if:
+   - `S_deg < 10-12°`
+   - `region_type ∈ {BASIN, PLATFORM, FOOTHILL margin}`
+   - Weight higher in **LOW/MID** elevation zones (E_rel < 0.7)
+2. In **UPLAND, HIGH E_rel (E_rel > 0.7) and STEEP (S_deg > 25°):**
+   - Deposition weight ≈ 0
+   - Sandstone can appear only as previously deposited units now uplifted/eroded, so you don't grow new sandstone packages there
+3. Deposition mask: `(S_deg < 12°) AND (region_type ∈ {BASIN, PLATFORM, FOOTHILL}) AND (E_rel < 0.7)`
+4. Suppression mask: `(region_type == UPLAND) AND (E_rel > 0.7) AND (S_deg > 25°)` → weight = 0.05-0.1
+
+#### Conglomerate
+
+**Thickness Ranges:**
+- **Per layer:** 10-200 m
+- **Biggest fans:** Up to 300 m
+- **Real proximal alluvial-fan deposits:** Can be hundreds to >1000 m
+- **Minimum:** 5 m
+- **Maximum:** 300 m
+
+**Where They Exist:**
+- Near mountain fronts:
+  - Regions with high mean slope (**UPLAND edge / FOOTHILL**)
+  - Local slopes **GENTLE-MODERATE** (3° ≤ S_deg ≤ 20°) at the toe of steeper slopes upslope
+
+**Rules:**
+1. Only deposit conglomerate where:
+   - `region_type ≈ FOOTHILL / UPLAND edge` (high relief, mean S_deg 8-20°)
+   - `3° ≤ S_deg ≤ 20°` (local slope)
+   - There is steeper terrain upslope (use aspect + neighborhood check)
+2. In deep **BASINS** far from steep sources: conglomerate weight ~0
+3. Deposition mask: `(region_type ∈ {FOOTHILL, UPLAND_edge}) AND (3° ≤ S_deg ≤ 20°) AND (steep_upslope_exists)`
+4. Suppression mask: `(region_type == BASIN) OR (S_deg < 3°) OR (S_deg > 25°)` → weight = 0.1-0.3
+
+#### Siltstone, Mudstone, Shale, Clay (Lithified)
+
+**Group:** Fine clastics
+
+**Thickness Ranges:**
+- **Per named layer:** 5-100 m
+- **Individual formations:** Often 10-200 m
+- **Thick mud/shale successions:** Can be 100s of meters to >1 km
+- **Minimum:** 3 m
+- **Maximum:** 400 m (for shale in deep basins)
+
+**Where They Exist:**
+- Low-energy parts of **BASINS** and floodplains:
+  - `E_rel < 0.4`
+  - `S_deg < 5-8°`
+  - Strongest in **BASIN** regions
+
+**Rules:**
+1. In **BASIN** and low-slope zones:
+   - High weights for mudstone/shale/siltstone/clay
+2. In **HIGH-elevation UPLAND** regions:
+   - Heavily suppress new deposition of these
+   - They can still be present as deeply buried or uplifted older units, but not capping steep mountains
+3. This ensures deep basins are mud-prone, not sandstone blankets
+4. Deposition mask: `(region_type == BASIN) AND (E_rel < 0.4) AND (S_deg < 8°)`
+5. Suppression mask: `(region_type == UPLAND) AND (E_rel > 0.7) AND (S_deg > 10°)` → weight = 0.05-0.2
+
+**Individual Rules:**
+
+- **Shale:** Primary fine-grained facies in basins, 20-400 m
+- **Mudstone:** Deepest, quietest parts of basins, 30% of shale package in valleys, 5-120 m
+- **Siltstone:** Intermediate between shale and sandstone, 20% of shale + 10% of sandstone in valleys, 5-80 m
+- **Clay (lithified):** Very fine-grained, 5-50 m, restricted to deepest basins
+
+---
+
+### 4.5 Unconsolidated Clastics (Near-Surface)
+
+#### Sand (Unlithified)
+
+**Thickness Ranges:**
+- **Typical:** 1-20 m
+- **Locally more:** Up to 30 m in dune fields
+- **Beach sands:** Usually a few meters thick
+- **Minimum:** 0.5 m
+- **Maximum:** 30 m
+
+**Where They Exist:**
+- Desert or coastal analogues: low slope areas, often mid to low relief
+- Can exist at any E_rel, but needs **GENTLE/FLAT** slopes
+
+**Rules:**
+1. Only allow if `S_deg < 10°`
+2. Emphasize plateau tops or broad valley floors, not steep slopes
+3. In **HIGH, STEEP** uplands: sand thickness forced to near-zero (blown/washed away)
+4. Deposition mask: `(S_deg < 10°) AND (NOT (region_type == UPLAND AND E_rel > 0.7 AND S_deg > 25°))`
+5. Suppression: `(S_deg > 10°) OR (region_type == UPLAND AND E_rel > 0.7 AND S_deg > 25°)` → weight = 0.05
+
+#### Silt & Clay (Unlithified)
+
+**Thickness Ranges:**
+- **Floodplain and lacustrine muds:** Typically 1-10 m
+- **Big lakes:** Sometimes tens of meters
+- **Minimum:** 0.5 m
+- **Maximum:** 15 m
+
+**Where They Exist:**
+- Valley bottoms and lake basins:
+  - `S_deg < 3-5°`
+  - High flow accumulation or closed depressions
+
+**Rules:**
+1. Only deposit where valley-bottom or lake masks say so
+2. Not allowed in steep uplands or strongly convex ridges
+3. Deposition mask: `(S_deg < 5°) AND (valley_bottom_mask OR closed_basin_mask) AND (high_flow_accumulation)`
+4. Suppression: `(S_deg > 5°) OR (region_type == UPLAND AND E_rel > 0.7)` → weight = 0
+
+---
+
+### 4.6 Regolith / Soil Layers
+
+#### WeatheredBR (Weathered Bedrock) & Saprolite
+
+**Thickness Ranges:**
+- **Weathered rock + saprolite commonly:** 3-30 m
+- **Can exceed:** 30 m in deeply weathered terrains
+- **WeatheredBR:** 2-10 m
+- **Saprolite:** 5-30 m
+- **Minimum:** 0.5 m
+- **Maximum:** 30 m (saprolite), 10 m (weatheredBR)
+
+**Where They Exist:**
+- Under most landscapes except very young/steep rock
+- Thickest in low-moderate slopes and **MID** elevation zones
+
+**Rules:**
+1. Saprolite thickness ∝ exp(-k × S_deg):
+   - At **STEEP** slopes (S_deg > 25°): cap at 0-5 m
+   - At **GENTLE** slopes (S_deg < 8°): allow up to max
+2. In very **HIGH UPLANDS** with strong relief: reduce saprolite/WeatheredBR (active erosion)
+3. Optimal range: **GENTLE-MODERATE** slopes (5-20°)
+4. Thickness formula: `T_saprolite = base × exp(-0.1 × S_deg) × (1 - 0.5 × (E_rel > 0.7))`
+5. Suppression: `(S_deg > 30°) OR (region_type == UPLAND AND E_rel > 0.7 AND S_deg > 20°)` → weight = 0.1-0.2
+
+#### Colluvium
+
+**Thickness Ranges:**
+- **Usually:** 1-10 m
+- **Major hollows/fans:** Can be thicker, up to 15-18 m
+- **Minimum:** 0.5 m
+- **Maximum:** 18 m (can exceed in foot slopes)
+
+**Where They Exist:**
+- Concave midslopes and hollows:
+  - **MODERATE** slopes (8-25°)
+  - Positive curvature (concave)
+
+**Rules:**
+1. `T_colluvium = f(upslope_area, curvature, mid-slope S_deg)`
+2. In valley bottoms (S_deg < 3°), reclass part of this as alluvium instead
+3. Optimal: **MODERATE** slopes (10-25°) with concave curvature
+4. Thickness increases with upslope contributing area of steep terrain
+5. Deposition mask: `(8° ≤ S_deg ≤ 25°) AND (curvature > 0) AND (NOT valley_bottom)`
+6. Suppression: `(S_deg < 8°) OR (S_deg > 25°) OR (curvature < 0)` → weight = 0.1-0.3
+
+#### Subsoil / Soil
+
+**Thickness Ranges:**
+- **Mean soil thickness:** Often 0.5-1.5 m
+- **Up to:** About 2 m
+- **Tropical settings:** Can be thicker, but that's mostly weathered rock/saprolite below
+- **Subsoil:** 0.3-1.5 m
+- **Soil (if separated):** Similar range
+- **Minimum:** 0.1 m
+- **Maximum:** 2 m
+
+**Where They Exist:**
+- Everywhere except bare rock outcrops
+
+**Rules:**
+1. Tie to regolith thickness:
+   - Soil/Subsoil thickness ≤ some fraction (e.g., 0.2-0.3) of total regolith
+2. Reduce toward zero on the steepest convex ridges (exposed rock)
+3. Thickness formula: `T_soil = 0.4 × T_total_regolith × (1 - 0.8 × (S_deg > 30°)) × (1 - 0.5 × (curvature < -threshold))`
+4. Suppression: `(S_deg > 35°) OR (region_type == UPLAND AND E_rel > 0.7 AND S_deg > 25° AND curvature < -threshold)` → weight = 0.05-0.1
+
+---
+
+### 4.7 Summary Table: Deposition Masks by Layer
+
+| Layer | Thickness Range | Region Type | Elevation (E_rel) | Slope (S_deg) | Additional Constraints |
+|-------|----------------|-------------|------------------|---------------|----------------------|
+| **Basement** | 500-3000 m | All | All | All | Always lowest; exposed in UPLAND, HIGH, STEEP |
+| **Basalt** | 10-300 m | UPLAND, BASIN, PLATFORM | All | < 8° | Patchy distribution, not everywhere |
+| **Limestone** | 10-350 m | PLATFORM, BASIN | 0.3-0.7 | < 5° | NOT in UPLAND or HIGH elevation |
+| **Dolomite** | 5-200 m | PLATFORM, BASIN | 0.3-0.7 | < 5° | Same as limestone, slightly more restricted |
+| **Evaporite** | 10-200 m | BASIN only | < 0.3 | < 3° | Closed basin required, NEVER in UPLAND |
+| **Sandstone** | 5-300 m | BASIN, PLATFORM, FOOTHILL | < 0.7 | < 12° | NOT in UPLAND with HIGH elevation |
+| **Conglomerate** | 10-300 m | FOOTHILL, UPLAND edge | All | 3-20° | Requires steep upslope, NOT in deep BASIN |
+| **Shale** | 5-400 m | BASIN | < 0.4 | < 8° | NOT in UPLAND with HIGH elevation |
+| **Mudstone** | 5-120 m | BASIN | < 0.4 | < 8° | Deepest basins, 30% of shale in valleys |
+| **Siltstone** | 5-80 m | BASIN | < 0.4 | < 8° | Intermediate, 20% shale + 10% sandstone |
+| **Sand (unlit.)** | 1-30 m | All | All | < 10° | NOT in HIGH, STEEP uplands |
+| **Silt/Clay (unlit.)** | 0.5-15 m | BASIN, valleys | < 0.4 | < 5° | Valley bottoms, high flow accumulation |
+| **Saprolite** | 5-30 m | All | All | 5-20° optimal | Suppressed on STEEP slopes |
+| **Colluvium** | 0.5-18 m | All | All | 8-25° | Concave curvature, foot slopes |
+| **Soil/Subsoil** | 0.1-2 m | All | All | All | Suppressed on very STEEP, convex ridges |
+
+**Key Suppression Rules:**
+- **UPLAND + HIGH (E_rel > 0.7) + STEEP (S_deg > 25°):** Suppress all new sedimentary deposition (weight = 0.05-0.1)
+- **UPLAND + HIGH:** Suppress carbonates, evaporites, fine clastics (weight = 0)
+- **Deep BASIN:** Suppress conglomerate (weight = 0.1-0.3)
+
+---
+
+## 5. Layer-Specific Rules by Region
 
 ### 3.1 Regolith Layers
 
@@ -354,7 +767,7 @@ The terrain is classified into distinct geomorphic zones, each with characterist
 
 ---
 
-## 4. Layer Relationship Rules
+## 6. Layer Relationship Rules
 
 ### 4.1 Vertical Ordering (Top to Bottom)
 
@@ -448,7 +861,7 @@ The terrain is classified into distinct geomorphic zones, each with characterist
 
 ---
 
-## 5. Thickness Constraints
+## 7. Thickness Constraints
 
 ### 5.1 Maximum Thickness Limits
 
@@ -492,7 +905,7 @@ The terrain is classified into distinct geomorphic zones, each with characterist
 
 ---
 
-## 6. Implementation Guidelines
+## 8. Implementation Guidelines
 
 ### 6.1 Processing Order
 
@@ -568,7 +981,7 @@ Key parameters to tune for different geological settings:
 
 ---
 
-## 7. Scientific Basis
+## 9. Scientific Basis
 
 ### 7.1 Energy-Based Deposition
 
@@ -600,7 +1013,7 @@ Key parameters to tune for different geological settings:
 
 ---
 
-## 8. Summary of Key Rules
+## 10. Summary of Key Rules
 
 ### 8.1 Topographic Rules
 - **Ridges:** Thin regolith, suppressed sediments, exposed bedrock
