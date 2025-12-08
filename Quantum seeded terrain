@@ -1027,8 +1027,8 @@ def generate_stratigraphy(
   colluvium_max_m=18.0,
   wC_gentle=0.35, wC_curv=0.30, wC_low=0.20, wC_twi=0.15,
   C_relief_px=31, C_twi_k1=7, C_twi_k2=13, C_sigma=0.20, C_floor=0.5, C_bias=1.0,
-  # Saprolite controls
-  sap_median=6.0, sap_min=0.5, sap_max=30.0, sap_w_gentle=0.6, sap_w_inter=0.4, sap_relief_px=61, sap_sigma=0.35,
+  # Saprolite controls (INCREASED for visible weathering mantle)
+  sap_median=12.0, sap_min=2.0, sap_max=40.0, sap_w_gentle=0.6, sap_w_inter=0.4, sap_relief_px=61, sap_sigma=0.35,
   # Weathered rind controls
   rind_median=1.8, rind_min=0.4, rind_max=6.0, rind_patch_beta=3.0, rind_patch_alpha=0.5,
   # Competent rock package (relative proportions)
@@ -1148,22 +1148,26 @@ def generate_stratigraphy(
   # Present slope – steeper = more erosion, so thinner preserved cover.
   gentle    = 1.0 - slope_norm
 
-  # Facies environments (all 0–1 after _normalize):
-  # CRITICAL FIX: ALL sedimentary rocks must thicken in basins (user requirement)
-  sand_env_raw  = basins * (0.8 + 0.2 * gentle)  # Favor basins directly
-  shale_env_raw = basins  # Maximum in deepening basins (offshore muds)
-  lime_env_raw  = basins * (0.7 + 0.3 * gentle)  # Also favor basins (marine sedimentation)
+  # SIMPLIFIED FACIES LOGIC:
+  # Key insight: EROSION (applied later) breaks up any "blanket" on peaks
+  # All sedimentary rocks thicken in basins (accommodation space)
+  # Erosion strips 50-200m from current high elevations
+  # 
+  # Result: Basins preserve thick sandstone+shale+limestone
+  #         Peaks are eroded, exposing shale/limestone/basement
+  
+  sand_env  = basins  # Directly proportional to basins
+  shale_env = basins  # Maximum in deepest basins
+  lime_env  = basins  # Carbonates also in basins
 
-  sand_env  = _normalize(sand_env_raw)
-  shale_env = _normalize(shale_env_raw)
-  lime_env  = _normalize(lime_env_raw)
-
-  # Relative vertical proportions from unit_thickness_m
+  # CRITICAL FIX: Reduce sandstone fraction (it was dominating as a cap)
+  # Sandstone should be a FACIES (specific environments), not 1/3 of all sediment
+  # Realistic basin fill: ~60% shale/mudstone, ~25% limestone, ~15% sandstone
   T_sand, T_shale, T_lime = unit_thickness_m
   total_units = float(T_sand + T_shale + T_lime + 1e-12)
-  f_sand  = T_sand  / total_units
-  f_shale = T_shale / total_units
-  f_lime  = T_lime  / total_units
+  f_sand  = 0.15  # REDUCED from ~30% to 15% (sandstone as facies)
+  f_shale = 0.60  # INCREASED (shales dominate basin centers)
+  f_lime  = 0.25  # Carbonate platforms
 
   # Helper: smoothed random field (quantum-seeded, but laterally coherent)
   def smooth_random_field(k):
@@ -1172,14 +1176,17 @@ def generate_stratigraphy(
 
   k_thick = max(15, int(0.06 * N) | 1)
 
-  # Base thickness fields (trend) for each unit
-  # CRITICAL FIX: Thickness is MAXIMUM in basins, MINIMUM on highs
-  # MULTIPLY by basins factor so thickness increases in basins!
-  basin_thickness_mult = 0.3 + 2.0 * basins  # 0.3x on highs, 2.3x in basins
+  # SIMPLIFIED: Direct basin control on total sediment capacity
+  # sed_total should be LARGE in basins, SMALL on highs (not tied to crust_thick)
+  sed_base = 50.0  # Minimum sediment thickness (m)
+  sed_max = 500.0  # Maximum in deepest basins (m)
+  sed_total_simplified = sed_base + sed_max * basins  # Direct basin control
   
-  base_sand  = sed_total * f_sand  * (0.4 + 0.6 * sand_env) * basin_thickness_mult
-  base_shale = sed_total * f_shale * (0.3 + 0.7 * shale_env) * basin_thickness_mult
-  base_lime  = sed_total * f_lime  * (0.3 + 0.7 * lime_env) * basin_thickness_mult
+  # Each facies gets its fraction of available space, multiplied by favorability
+  # NO artificial floor (0.4 + 0.6*env) - let it go to ZERO where unfavorable
+  base_sand  = sed_total_simplified * f_sand  * sand_env  # Can be ZERO
+  base_shale = sed_total_simplified * f_shale * shale_env
+  base_lime  = sed_total_simplified * f_lime  * lime_env
 
   # Quantum-smoothed variability
   rnd_sand  = smooth_random_field(k_thick)
@@ -1202,12 +1209,12 @@ def generate_stratigraphy(
   t_shale_rock = t_shale_trend * thin_factor
   t_lime_rock  = t_lime_trend  * thin_factor
   
-  # Add other sedimentary rock types (also basin-responsive)
-  t_conglomerate = (base_sand * 0.3) * thin_factor * basin_thickness_mult
-  t_mudstone     = (base_shale * 0.35) * thin_factor * basin_thickness_mult
-  t_siltstone    = (base_shale * 0.25) * thin_factor * basin_thickness_mult
-  t_dolomite     = (base_lime * 0.20) * thin_factor * basin_thickness_mult
-  t_evaporite    = (basins * 15.0) * (gentle**2) * basin_thickness_mult  # Maximum in deep basins
+  # Add other sedimentary rock types (proportional to main facies)
+  t_conglomerate = (base_sand * 0.3) * thin_factor  # Coarse clastic margins
+  t_mudstone     = (base_shale * 0.35) * thin_factor
+  t_siltstone    = (base_shale * 0.25) * thin_factor
+  t_dolomite     = (base_lime * 0.20) * thin_factor
+  t_evaporite    = (basins**2 * 15.0) * (gentle**2)  # Only deepest, flattest basins
 
   # ---------- 4) Structural tops for sedimentary rocks ----------
   # With thickness controlled by basins (above), the basement will naturally end up:
@@ -1250,15 +1257,34 @@ def generate_stratigraphy(
   top_silt = top_clay - t_clay
   top_sand = top_silt - t_silt
 
-  # Ensure rock units stay below valley fill and respect ordering
-  top_sandstone = np.minimum(top_sandstone_raw, top_sand - eps)
-  top_conglomerate = np.minimum(top_conglomerate_raw, top_sandstone - eps)
-  top_shale     = np.minimum(top_shale_raw,     top_conglomerate - eps)
-  top_mudstone = np.minimum(top_mudstone_raw, top_shale - eps)
-  top_siltstone = np.minimum(top_siltstone_raw, top_mudstone - eps)
-  top_limestone = np.minimum(top_limestone_raw, top_siltstone - eps)
-  top_dolomite = np.minimum(top_dolomite_raw, top_limestone - eps)
-  top_evaporite = np.minimum(top_evaporite_raw, top_dolomite - eps)
+  # ========== CRITICAL: ADD POST-DEPOSITIONAL EROSION ==========
+  # This removes the "sandstone blanket" by stripping material from peaks
+  # Mountains expose deeper units; valleys preserve full section
+  
+  # Erosion depth: proportional to relative elevation + slope
+  E_rel = (E - E.mean()) / (E.std() + 1e-9)  # Relative elevation
+  erosion_depth = np.maximum(0, 50.0 * E_rel + 100.0 * slope_norm)  # 0-200m removed from peaks
+  erosion_depth = _box_blur(erosion_depth, k=7)  # Smooth erosion pattern
+  
+  # Apply erosion to sediment tops (lowers the top of each unit)
+  top_sandstone_eroded = top_sandstone_raw - erosion_depth
+  top_conglomerate_eroded = top_conglomerate_raw - erosion_depth
+  top_shale_eroded = top_shale_raw - erosion_depth
+  top_mudstone_eroded = top_mudstone_raw - erosion_depth
+  top_siltstone_eroded = top_siltstone_raw - erosion_depth
+  top_limestone_eroded = top_limestone_raw - erosion_depth
+  top_dolomite_eroded = top_dolomite_raw - erosion_depth
+  top_evaporite_eroded = top_evaporite_raw - erosion_depth
+  
+  # Now enforce ordering with eroded tops
+  top_sandstone = np.minimum(top_sandstone_eroded, top_sand - eps)
+  top_conglomerate = np.minimum(top_conglomerate_eroded, top_sandstone - eps)
+  top_shale     = np.minimum(top_shale_eroded,     top_conglomerate - eps)
+  top_mudstone = np.minimum(top_mudstone_eroded, top_shale - eps)
+  top_siltstone = np.minimum(top_siltstone_eroded, top_mudstone - eps)
+  top_limestone = np.minimum(top_limestone_eroded, top_siltstone - eps)
+  top_dolomite = np.minimum(top_dolomite_eroded, top_limestone - eps)
+  top_evaporite = np.minimum(top_evaporite_eroded, top_dolomite - eps)
 
     # ---------- 5b) Crystalline basement partition (Midcontinent style) ----------
   # Total crystalline column between evaporites and basement floor
@@ -1874,10 +1900,10 @@ if __name__ == "__main__":
     strata = generate_stratigraphy(
         z_norm=z, rng=rng,
         elev_range_m=700.0, pixel_scale_m=10.0,
-        soil_range_m=(0.3, 1.8),
+        soil_range_m=(2.0, 8.0),  # INCREASED
         colluvium_max_m=18.0, wC_gentle=0.35, wC_curv=0.30, wC_low=0.20, wC_twi=0.15,
         C_relief_px=31, C_twi_k1=7, C_twi_k2=13, C_sigma=0.20, C_floor=0.5, C_bias=1.0,
-        sap_median=6.0, sap_min=0.5, sap_max=30.0, sap_w_gentle=0.6, sap_w_inter=0.4, sap_relief_px=61, sap_sigma=0.35,
+        sap_median=12.0, sap_min=2.0, sap_max=40.0,  # INCREASED sap_w_gentle=0.6, sap_w_inter=0.4, sap_relief_px=61, sap_sigma=0.35,
         rind_median=1.8, rind_min=0.4, rind_max=6.0, rind_patch_beta=3.0, rind_patch_alpha=0.5,
         unit_thickness_m=(90.0,110.0,100.0),
         undulation_amp_m=10.0, undulation_beta=3.2,
