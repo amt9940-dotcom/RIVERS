@@ -1075,15 +1075,17 @@ def generate_stratigraphy(
   # Reference: Principles of Sedimentology and Stratigraphy (Boggs) - accommodation space
   # Use concavity to control thickness: thick in concave basins, thin on convex ridges
   
-  # Thickness factor based on basin geometry
-  # Concave (basins): thickness factor > 1.0 (thicken)
-  # Convex (ridges): thickness factor < 1.0 (thin)
-  # Neutral: thickness factor = 1.0
-  basin_thickness_factor = 0.3 + 1.4 * basin_geometry  # Range: 0.3 (ridges) to 1.7 (basins)
-  ridge_thinning_factor = 0.2 + 0.8 * (1.0 - ridge_geometry)  # Thin on ridges
+  # MUCH STRONGER thickness factor based on basin geometry
+  # Concave (basins): thickness factor >> 1.0 (thicken dramatically)
+  # Convex (ridges): thickness factor << 1.0 (thin dramatically)
+  # This creates realistic wedge geometry where layers pinch out over highs
+  basin_thickness_factor = 0.1 + 3.9 * basin_geometry  # Range: 0.1 (ridges) to 4.0 (basins) - MUCH STRONGER
+  ridge_thinning_factor = 0.15 + 0.85 * (1.0 - ridge_geometry)  # Thin on ridges
   
-  # Combined thickness factor: thicken in basins, thin on ridges
+  # Combined thickness factor: thicken dramatically in basins, thin dramatically on ridges
   accommodation_factor = basin_thickness_factor * ridge_thinning_factor
+  # Smooth accommodation factor to avoid pixel-scale noise
+  accommodation_factor = _box_blur(accommodation_factor, k=7)
   
   # Base thickness fields (trend) for each consolidated rock unit
   base_sandstone  = sed_total * f_sand  * (0.4 + 0.6 * sand_env_rock)
@@ -1210,25 +1212,30 @@ def generate_stratigraphy(
   # CRITICAL GEOLOGICAL RULE: Regolith thickness inversely related to slope
   # Reference: USDA Soil Survey Manual - regolith rarely exceeds few meters on steep terrain
   # Colluvium accumulates at hillslope bases, not peaks
+  # CRITICAL FIX: Increase base regolith thicknesses significantly to make them visible
   
   # Slope-dependent thickness factor: thin on steep slopes, thick on gentle
-  # Use exponential decay: thickness = max_thickness * exp(-slope_factor)
-  slope_decay_factor = np.exp(-slope_n * 3.0)  # Decay rapidly with slope
-  gentle_slope_factor = np.clip((0.3 - slope_n) / 0.3, 0.0, 1.0)  # Only on gentle slopes
+  # Use gentler decay: thickness = max_thickness * (1 - slope_factor * 0.7)
+  # This allows more regolith on moderate slopes
+  slope_decay_factor = np.clip(1.0 - slope_n * 0.7, 0.2, 1.0)  # Gentler decay, minimum 20%
+  gentle_slope_factor = np.clip((0.4 - slope_n) / 0.4, 0.0, 1.0)  # On gentle to moderate slopes
   
   # A and B horizons (Topsoil and Subsoil)
-  # Topsoil thickness already accounts for slope (via soil_thickness_from_slope)
+  # INCREASE base thicknesses significantly
+  topsoil_base = topsoil_thick * 2.0  # Double topsoil thickness
+  subsoil_base = subsoil_thick * 2.5   # Increase subsoil thickness
+  
   # Further reduce topsoil on very steep slopes (cliffs, rock faces)
-  steep_cliff_mask = slope_n > 0.7  # Very steep slopes (>70% normalized)
-  topsoil_thick_adjusted = np.where(steep_cliff_mask, topsoil_thick * 0.1, topsoil_thick)
+  steep_cliff_mask = slope_n > 0.8  # Very steep slopes (>80% normalized) - more restrictive
+  topsoil_thick_adjusted = np.where(steep_cliff_mask, topsoil_base * 0.2, topsoil_base)
   
-  # Apply slope-dependent reduction
+  # Apply slope-dependent reduction (gentler than before)
   topsoil_thick_adjusted = topsoil_thick_adjusted * slope_decay_factor
-  subsoil_thick_adjusted = subsoil_thick * slope_decay_factor
+  subsoil_thick_adjusted = subsoil_base * slope_decay_factor
   
-  # In mountains, further reduce regolith thickness (erosion dominates)
-  topsoil_thick_adjusted = topsoil_thick_adjusted * np.where(mountain_mask, 0.3, 1.0)
-  subsoil_thick_adjusted = subsoil_thick_adjusted * np.where(mountain_mask, 0.3, 1.0)
+  # In mountains, reduce regolith but not as much (still need visible regolith)
+  topsoil_thick_adjusted = topsoil_thick_adjusted * np.where(mountain_mask, 0.5, 1.0)  # Less reduction
+  subsoil_thick_adjusted = subsoil_thick_adjusted * np.where(mountain_mask, 0.5, 1.0)  # Less reduction
   
   # Surface is E, all layers below it
   top_topsoil   = E
@@ -1238,20 +1245,22 @@ def generate_stratigraphy(
   # Colluvium, saprolite, weathered rind
   # CRITICAL: Colluvium only forms at slope breaks (mid-to-base of slopes), not peaks
   # Use concavity to identify slope breaks (where colluvium accumulates)
-  colluvium_slope_factor = np.clip((0.4 - slope_n) / 0.4, 0.0, 1.0)  # Only on moderate slopes
-  colluvium_location_factor = concavity * colluvium_slope_factor  # At slope breaks
+  # INCREASE colluvium thickness significantly
+  colluvium_slope_factor = np.clip((0.5 - slope_n) / 0.5, 0.0, 1.0)  # On moderate slopes
+  colluvium_location_factor = (0.3 + 0.7 * concavity) * colluvium_slope_factor  # At slope breaks
   
-  tC_adjusted = tC * colluvium_location_factor * np.where(mountain_mask, 0.2, 1.0)
-  tC_adjusted = np.clip(tC_adjusted, 0.0, 20.0)  # Max 20m colluvium
+  tC_adjusted = tC * 2.0 * colluvium_location_factor * np.where(mountain_mask, 0.4, 1.0)  # Double thickness
+  tC_adjusted = np.clip(tC_adjusted, 0.0, 30.0)  # Max 30m colluvium (increased from 20m)
   
   # Saprolite: thickest on gentle, stable interfluves
-  tS_adjusted = tS * gentle_slope_factor * np.where(mountain_mask, 0.3, 1.0)
+  # INCREASE saprolite thickness significantly
+  tS_adjusted = tS * 2.5 * gentle_slope_factor * np.where(mountain_mask, 0.5, 1.0)  # Increase thickness
   
   top_saprolite = top_colluvium - tC_adjusted
   top_rind      = top_saprolite - tS_adjusted
   
-  # Ensure regolith doesn't go below reasonable depth
-  top_rind = np.maximum(top_rind, E - 20.0)  # Max 20m regolith
+  # Ensure regolith doesn't go below reasonable depth - INCREASE max depth
+  top_rind = np.maximum(top_rind, E - 50.0)  # Max 50m regolith (increased from 20m)
 
   # ========== STRATIGRAPHIC STACKING WITH GEOLOGICAL RULES ==========
   # Order from top to bottom: Topsoil → Sand/Silt → Clay → Gravel → Bedrock
@@ -1314,20 +1323,41 @@ def generate_stratigraphy(
   # In mountains: reduce sedimentary thickness, expose igneous/metamorphic
   # In lowlands: thick sedimentary sequences
   
-  # ========== SANDSTONE LOCALIZATION ==========
-  # CRITICAL GEOLOGICAL RULE: Sandstone should be localized to depositional systems
-  # NOT everywhere - only in valleys, former deltas, or uplifted horizontal layers
-  # Reference: USGS Fluvial Sandstone Deposits
+  # ========== BREAK UP UNIFORM SANDSTONE INTO MULTIPLE INTERVALS ==========
+  # CRITICAL FIX: Instead of one giant sandstone slab, create multiple variable intervals
+  # separated by shale/silt/mudstone layers
+  # This creates realistic stratigraphic sequences, not one mega-layer
   
-  # Sandstone restriction: reduce in high elevations and steep slopes
-  sandstone_elevation_factor = np.clip(1.0 - E_norm * 0.9, 0.1, 1.0)  # Reduce in high elevations
-  sandstone_slope_factor = np.clip(1.0 - slope_n * 0.7, 0.2, 1.0)  # Reduce on steep slopes
-  sandstone_restriction = sandstone_elevation_factor * sandstone_slope_factor
+  # Sandstone restriction: MUCH stronger - localize to specific environments
+  sandstone_elevation_factor = np.clip(1.0 - E_norm * 1.2, 0.0, 1.0)  # Strong reduction in high elevations
+  sandstone_slope_factor = np.clip(1.0 - slope_n * 1.0, 0.0, 1.0)  # Strong reduction on steep slopes
+  sandstone_basin_factor = basins * (1.0 - basins)  # Prefer basin margins, not everywhere
+  sandstone_restriction = sandstone_elevation_factor * sandstone_slope_factor * (0.3 + 0.7 * sandstone_basin_factor)
+  
+  # Create VARIABLE sandstone intervals - not uniform
+  # Use multiple random fields to create patchy distribution
+  sandstone_patch1 = smooth_random_field(k_thick * 2)  # Coarse patches
+  sandstone_patch2 = smooth_random_field(k_thick * 3)  # Finer patches
+  sandstone_variability = _normalize(sandstone_patch1 + sandstone_patch2 * 0.5)
+  
+  # Sandstone only appears where restriction AND variability allow
+  sandstone_presence = sandstone_restriction * sandstone_variability
+  sandstone_presence = np.clip(sandstone_presence, 0.0, 1.0)
   
   # Adjust sedimentary rock thickness based on terrain
-  t_sandstone_adjusted = t_sandstone * np.where(mountain_mask, 0.2, lowland_sediment_factor) * sandstone_restriction
-  t_shale_adjusted = t_shale_rock * np.where(mountain_mask, 0.2, lowland_sediment_factor)
-  t_lime_adjusted = t_lime_rock * np.where(mountain_mask, 0.2, lowland_sediment_factor)
+  # Sandstone: MUCH more variable, localized, and responsive to basins
+  t_sandstone_adjusted = t_sandstone * np.where(mountain_mask, 0.1, lowland_sediment_factor) * sandstone_presence * accommodation_factor
+  
+  # Shale: thickens strongly in basins, forms between sandstone intervals
+  t_shale_adjusted = t_shale_rock * np.where(mountain_mask, 0.2, lowland_sediment_factor) * accommodation_factor
+  
+  # Limestone: only in appropriate environments
+  t_lime_adjusted = t_lime_rock * np.where(mountain_mask, 0.2, lowland_sediment_factor) * accommodation_factor
+  
+  # Smooth thicknesses to prevent pixel-scale noise
+  t_sandstone_adjusted = _box_blur(t_sandstone_adjusted, k=5)
+  t_shale_adjusted = _box_blur(t_shale_adjusted, k=5)
+  t_lime_adjusted = _box_blur(t_lime_adjusted, k=5)
   
   # Base interfaces for consolidated sedimentary rocks
   top_sandstone_raw = np.minimum(top_sed_ref, top_valley_fill_bottom - eps)
@@ -1375,11 +1405,28 @@ def generate_stratigraphy(
       E - min_basement_depth
   )
   
+  # ========== AGGRESSIVELY SMOOTH BASEMENT SURFACE ==========
+  # CRITICAL FIX: Smooth basement surface to prevent spiky chimneys
+  # Basement surfaces should be smooth laterally, not pixel-scale sawtooth
+  smooth_k_basement = max(15, int(0.1 * N) | 1)  # Large smoothing kernel for basement
+  top_basement_raw = _box_blur(top_basement_raw, k=smooth_k_basement)
+  
   # Ensure consolidated rocks stay below unconsolidated sediments and respect ordering
   top_sandstone = np.minimum(top_sandstone_raw, top_valley_fill_bottom - eps)
   top_shale     = np.minimum(top_shale_raw,     top_sandstone - eps)
   top_limestone = np.minimum(top_limestone_raw, top_shale - eps)
   top_basement  = np.minimum(top_basement_raw,  top_limestone - eps)
+  
+  # Smooth sedimentary interfaces to prevent pixel-scale noise
+  top_sandstone = _box_blur(top_sandstone, k=7)
+  top_shale = _box_blur(top_shale, k=7)
+  top_limestone = _box_blur(top_limestone, k=7)
+  
+  # Re-enforce ordering after smoothing
+  top_sandstone = np.minimum(top_sandstone, top_valley_fill_bottom - eps)
+  top_shale = np.minimum(top_shale, top_sandstone - eps)
+  top_limestone = np.minimum(top_limestone, top_shale - eps)
+  top_basement = np.minimum(top_basement, top_limestone - eps)
   
   # Ensure ALL layers are below surface
   top_sandstone = np.minimum(top_sandstone, E - eps)
@@ -1534,6 +1581,26 @@ def generate_stratigraphy(
   f_basalt *= scale
   f_ancient *= scale
 
+  # ========== AGGRESSIVELY SMOOTH BASEMENT FRACTIONS ==========
+  # CRITICAL FIX: Smooth fractions BEFORE converting to thicknesses
+  # This prevents pixel-scale spiky chimneys in basement
+  # Use large smoothing kernel to create smooth, laterally continuous basement
+  smooth_k = max(11, int(0.08 * N) | 1)  # Much larger smoothing kernel
+  f_granite = _box_blur(f_granite, k=smooth_k)
+  f_gneiss = _box_blur(f_gneiss, k=smooth_k)
+  f_schist = _box_blur(f_schist, k=smooth_k)
+  f_basalt = _box_blur(f_basalt, k=smooth_k)
+  f_ancient = _box_blur(f_ancient, k=smooth_k)
+  
+  # Renormalize after smoothing
+  total_frac_smooth = f_granite + f_gneiss + f_schist + f_basalt + f_ancient
+  scale_smooth = 0.85 / (total_frac_smooth + 1e-9)
+  f_granite *= scale_smooth
+  f_gneiss *= scale_smooth
+  f_schist *= scale_smooth
+  f_basalt *= scale_smooth
+  f_ancient *= scale_smooth
+
   # Convert fractions into actual thicknesses (m) with maximum constraints
   # Constrain individual layer thicknesses to prevent spikes
   max_layer_thick = np.where(mountain_mask, 150.0, 300.0)  # Max thickness per layer
@@ -1544,12 +1611,12 @@ def generate_stratigraphy(
   t_basalt  = np.clip(basement_total * f_basalt, 0.0, max_layer_thick)
   t_ancient = np.clip(basement_total * f_ancient, 0.0, max_layer_thick)
   
-  # Smooth thicknesses to prevent spikes
-  t_granite = _box_blur(t_granite, k=3)
-  t_gneiss = _box_blur(t_gneiss, k=3)
-  t_schist = _box_blur(t_schist, k=3)
-  t_basalt = _box_blur(t_basalt, k=3)
-  t_ancient = _box_blur(t_ancient, k=3)
+  # Smooth thicknesses AGGRESSIVELY to prevent spikes
+  t_granite = _box_blur(t_granite, k=smooth_k)
+  t_gneiss = _box_blur(t_gneiss, k=smooth_k)
+  t_schist = _box_blur(t_schist, k=smooth_k)
+  t_basalt = _box_blur(t_basalt, k=smooth_k)
+  t_ancient = _box_blur(t_ancient, k=smooth_k)
 
   # Build interfaces top-down from the evaporites
   # Create varied vertical stacking in mountains
@@ -1558,6 +1625,15 @@ def generate_stratigraphy(
   top_schist         = top_gneiss   - t_schist
   top_basalt         = top_schist   - t_basalt
   top_ancient_crust  = top_basalt   - t_ancient
+  
+  # ========== SMOOTH BASEMENT INTERFACES AGGRESSIVELY ==========
+  # CRITICAL: Smooth interfaces to prevent vertical chimneys
+  # This creates smooth basement surfaces, not pixel-scale sawtooth
+  top_granite = _box_blur(top_granite, k=smooth_k)
+  top_gneiss = _box_blur(top_gneiss, k=smooth_k)
+  top_schist = _box_blur(top_schist, k=smooth_k)
+  top_basalt = _box_blur(top_basalt, k=smooth_k)
+  top_ancient_crust = _box_blur(top_ancient_crust, k=smooth_k)
   
   # Ensure all basement layers are below surface and properly ordered
   top_granite = np.minimum(top_granite, E - eps)
