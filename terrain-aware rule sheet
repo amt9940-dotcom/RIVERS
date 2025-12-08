@@ -1,0 +1,271 @@
+Here’s a terrain-aware rule sheet you can paste into your project and build logic around.
+
+I’ll assume you can compute at least:
+
+elev – absolute elevation
+
+rel_elev – elevation relative to local neighborhood (high vs low)
+
+slope – gradient
+
+curv – curvature (concave < 0, convex > 0)
+
+flow_accum – drainage / contributing area
+
+basin_depth – allowed sediment thickness at (x,y) from your basin/subsidence model
+
+Global stratigraphic order (bottom → top)
+
+BasementFloor → Basement / AncientCrust → Granite / Gneiss / Basalt → sedimentary rocks (Evaporite/Dolomite/Limestone/Siltstone/Mudstone/Shale/Conglomerate/Sandstone) → unconsolidated (Gravel/Sand/Silt/Clay) → WeatheredBR → Saprolite → Colluvium → Subsoil → Topsoil → Surface
+
+All rules below should respect that vertical order unless you intentionally insert faults/unconformities.
+
+BASE / CRUSTAL LAYERS
+BasementFloor
+
+Role: never visible; numerical base of model.
+
+Rule: fill whatever depth remains below Basement; no terrain dependence needed.
+
+Basement / AncientCrust
+
+Role: oldest crystalline/metamorphic core of continent.
+
+Where allowed: deepest continuous layer everywhere.
+
+Where exposed: only where rel_elev is very high and erosion has removed almost all cover (mountain cores, shields).
+
+Thickness behavior: essentially infinite downward; you only care about its top surface.
+
+CRYSTALLINE / METAMORPHIC
+Granite / Gneiss
+
+Position: directly above Basement/AncientCrust.
+
+Where near surface:
+
+high rel_elev, steep slope, low basin_depth (uplifted, eroded highs);
+
+can crop out in deep canyons that cut through sediment stack.
+
+Where deep: under basins (large basin_depth); should not be within a few hundred meters of surface in broad lowlands.
+
+Thickness: regionally thick but not required everywhere; you can treat as a crystalline “cap” over Basement in some provinces, or let sediments sit directly on Basement in others.
+
+Basalt
+
+Role: volcanic flows / intrusions.
+
+Where allowed near surface:
+
+plateau-like regions with low slope but elevated rel_elev (lava plateaus), or localized “volcanic centers”.
+
+Where not: deep basin centers unless you’re modeling flood basalts.
+
+Thickness behavior: thin flows draping over older topography, not a continuous deep unit under everything.
+
+CONSOLIDATED SEDIMENTARY ROCKS
+
+Think of these as a package whose total thickness at (x,y) is controlled by basin_depth. Within that thickness, distribute formations according to facies rules.
+
+Conglomerate
+
+Environment: alluvial fans, proximal braided rivers, near steep source areas.
+
+Where allowed:
+
+close to margins of basement highs (small distance to high rel_elev),
+
+moderate–high slope, convex or straight curv.
+
+Where not: deep basin center (concave, very low slope).
+
+Vertical position: usually at the base of the sedimentary pile, directly above crystalline rock.
+
+Thickness trend: thicker along basin margins near uplifts, thinning rapidly basinward.
+
+Sandstone
+
+Environment: rivers, deltas, shorelines, dunes, shallow marine shelves.
+
+Where allowed:
+
+flanks of highs and basin margins (intermediate rel_elev),
+
+zones with significant flow_accum (fluvial),
+
+broad low-relief areas (aeolian/coastal).
+
+Where discouraged:
+
+deepest basin centers (favor shale/mudstone),
+
+very steep mountain cores (erosion dominated; thin or absent).
+
+Vertical position:
+
+multiple intervals: can occur low in the stack (older fluvial) and higher (younger shoreline/dune), not just one giant cap.
+
+Thickness trend: forms belts/wedges, not a domain-wide flat lid; should thin over structural highs and toward deep quiet-water centers.
+
+Shale / Mudstone
+
+Environment: low-energy offshore marine, deeper lake or floodplain.
+
+Where allowed:
+
+concave (curv < 0), low slope, low-to-moderate rel_elev → basin centers.
+
+Where discouraged: steep slopes, close to high rel_elev (too energetic).
+
+Vertical position: interbedded with sandstone and siltstone; often above basal sandstones/conglomerates and underlying limestones.
+
+Thickness trend: thickest in deepest accommodation (max basin_depth).
+
+Siltstone
+
+Environment: transitional between shale and sandstone (delta fronts, distal floodplains).
+
+Where allowed: moderate slope, slightly more energetic than shale areas.
+
+Vertical position: between shale/mudstone and sandstone intervals.
+
+Limestone
+
+Environment: shallow, warm, relatively clear marine platforms.
+
+Where allowed:
+
+low slope, low clastic input (far from big flow_accum paths),
+
+low-to-moderate rel_elev within broad, stable basins.
+
+Where not: steep mountain cores, high-energy fluvial belts.
+
+Vertical position: often capping sequences of shale/siltstone, can repeat in cycles.
+
+Dolomite
+
+Environment: altered limestone; older, more restricted.
+
+Where allowed: similar spatial pattern to limestone but typically deeper in the stack or in more interior, restricted parts of carbonate platforms.
+
+Vertical position: below younger limestones and shales.
+
+Evaporite
+
+Environment: closed, arid basins with high evaporation.
+
+Where allowed:
+
+very low rel_elev, strongly concave curv,
+
+internally drained areas (no down-slope flow exit based on flow_accum or basin mask).
+
+Where not: open slopes, through-flowing valleys, mountain tops.
+
+Vertical position: specific intervals within basin fill; not everywhere; usually under or interbedded with carbonates and fine clastics.
+
+UNCONSOLIDATED SEDIMENTS (ABOVE ROCKS, BELOW REGOLITH)
+
+These sit immediately under the weathering profile and above lithified rocks, mainly in actively depositional environments.
+
+Gravel
+
+Environment: active or recent high-energy channels, alluvial fans.
+
+Where allowed:
+
+high flow_accum + moderate/steep slope (channels),
+
+base of steep slopes (colluvial aprons).
+
+Vertical position: just above bedrock or lithified sediments; rarely deeply buried under other loose units unless you simulate stacking of terraces.
+
+Sand (unconsolidated)
+
+Environment: river bars, beaches, dunes.
+
+Where allowed:
+
+moderate energy zones (lower slope than gravel, still decent flow_accum),
+
+broad, low-slope regions (dune fields, coasts).
+
+Where not: deep basin centers with standing water (those favor silt/clay).
+
+Silt
+
+Environment: quiet parts of rivers, floodplains, lake margins.
+
+Where allowed: low slope, moderate flow_accum but low channel energy.
+
+Clay
+
+Environment: standing or very slow water: lake bottoms, estuaries, wetlands.
+
+Where allowed: very low slope, concave curv, ponded flow (flow_accum high but no strong outlet).
+
+Thickness of these four should be meters to tens of meters at most, and strongly localized rather than continuous blankets.
+
+WEATHERING / REGOLITH LAYERS
+
+Apply after you’ve chosen the rock type at the top of the column.
+
+WeatheredBR (weathered bedrock)
+
+Where: everywhere that is not extremely young or glaciated.
+
+Thickness: base of regolith; 1–10 m equivalent; more in warm, wet climates or on softer rocks.
+
+Saprolite
+
+Where: low-to-moderate slope under humid or long-lived surfaces.
+
+Where not: very steep slopes, freshly eroded canyons.
+
+Thickness trend: increases with surface stability (curv ~ 0 or slightly convex; low relief).
+
+Colluvium
+
+Where: bases of hillslopes, concave breaks in slope, footslope zones.
+
+Controls: moderate slope, concave curv, located downslope of convex ridges.
+
+Subsoil
+
+Where: just below topsoil on any surface that supports soil formation.
+
+Where not: bare rock faces, very steep slopes, active channels.
+
+Topsoil
+
+Where: very top cell under “Surface” everywhere except:
+
+extreme slopes,
+
+active channels,
+
+bare rock where erosion > soil production.
+
+Thickness trend: thicker on gentle slopes and in concave/flat zones, thinner on steep convex ridges.
+
+Practical generation order (conceptual)
+
+Define basement top (Basement/AncientCrust) from your tectonic/basin model.
+
+Compute basin_depth = distance between basement top and some reference “max fill” surface.
+
+Fill sedimentary pile from bottom up:
+
+Use basin_depth, rel_elev, slope, curv, flow_accum, and distance from highs to assign proportions of conglomerate, sandstone, shale/mudstone, siltstone, limestone/dolomite, evaporite at that (x,y).
+
+Ensure total thickness ≤ basin_depth.
+
+Apply erosion/unroofing from top down based on modern rel_elev, slope, drainage, removing some thickness and exposing deeper units on highs.
+
+Add unconsolidated sediments in active depositional environments (channels, floodplains, basins).
+
+Drape regolith/soil on top based on slope + curvature rules.
+
+Surface is simply the top of whatever stack you now have.
