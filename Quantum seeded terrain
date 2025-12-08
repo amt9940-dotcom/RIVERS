@@ -918,11 +918,35 @@ def generate_stratigraphy(
   E_norm = _normalize(E)
   low_elev = 1.0 - E_norm  # 1 = low elevation, 0 = high elevation
   
+  # ========== CURVATURE/CONCAVITY CALCULATION ==========
+  # Calculate local curvature to identify basins (concave) vs ridges (convex)
+  # This controls layer thickness: thicken in basins, thin on highs
+  # Reference: Principles of Sedimentology and Stratigraphy (Boggs) - accommodation space
+  
+  # Laplacian: <0 = convex (ridge), >0 = concave (valley/basin)
+  up    = np.roll(E, -1, axis=0)
+  down  = np.roll(E,  1, axis=0)
+  left  = np.roll(E,  1, axis=1)
+  right = np.roll(E, -1, axis=1)
+  laplacian = (up + down + left + right - 4.0 * E) / (pixel_scale_m**2)
+  
+  # Normalize curvature: 0 = convex (ridge), 1 = concave (basin)
+  concavity = _normalize(np.maximum(laplacian, 0.0))  # Only positive (concave) values
+  convexity = _normalize(np.maximum(-laplacian, 0.0))  # Only negative (convex) values
+  
+  # Smooth concavity to avoid noise
+  concavity = _box_blur(concavity, k=5)
+  
   # Very coarse topographic smooth to define basins vs highs
   k_coarse = max(31, int(0.15 * N) | 1)
   z_smooth = _box_blur(z_norm, k=k_coarse)
   basins   = _normalize(1.0 - z_smooth)   # 1 in lows, 0 on highs
   highs    = _normalize(z_smooth)         # 1 on highs
+  
+  # Combine concavity with basin identification for better basin geometry
+  # Basins should have high concavity AND low elevation
+  basin_geometry = concavity * (1.0 - E_norm)  # Strongest in concave, low areas
+  ridge_geometry = convexity * E_norm  # Strongest on convex, high areas
   
   # Helper: smoothed random field (quantum-seeded, but laterally coherent)
   def smooth_random_field(k):
@@ -1001,11 +1025,34 @@ def generate_stratigraphy(
   sed_frac  = 0.35
   sed_total = sed_frac * crust_thick
   
+  # ========== DEPOSITIONAL ENVIRONMENT RESTRICTIONS ==========
+  # CRITICAL GEOLOGICAL RULES:
+  # - Evaporites: Only in flat, closed basins with restricted drainage
+  # - Limestones/Dolomite: Shallow marine platforms, flat, low-lying areas
+  # - Sandstone: Localized to depositional systems (fluvial, coastal, aeolian)
+  # Reference: USGS Evaporite Basins - require flat, dry, enclosed basins
+  
+  # Identify closed basins: high concavity + low elevation + very gentle slope
+  flat_mask = slope_n < 0.1  # Very flat (<10% normalized slope)
+  closed_basin_mask = (basin_geometry > 0.7) & (flat_mask) & (E_norm < 0.5)  # Concave, flat, low
+  
   # Facies environments for consolidated sedimentary rocks (deeper package)
   # - Sandstone: shorelines / basin margins → intermediate basinness, some slope
+  # BUT: Localize to depositional systems, not everywhere
   sand_env_raw_rock  = basins * (1.0 - basins) * (0.5 + 0.5 * slope_n)
-  shale_env_raw = basins                        # deepening into basins (offshore muds)
-  lime_env_raw  = highs * gentle                # carbonate platforms on gentle highs
+  # Reduce sandstone in high elevations and steep slopes
+  sand_env_raw_rock = sand_env_raw_rock * np.clip(1.0 - E_norm * 0.8, 0.2, 1.0)
+  sand_env_raw_rock = sand_env_raw_rock * np.clip(1.0 - slope_n * 0.6, 0.3, 1.0)
+  
+  shale_env_raw = basins  # deepening into basins (offshore muds)
+  
+  # Limestone/Dolomite: ONLY in flat, low-lying areas (shallow marine platforms)
+  # NOT in mountains or steep slopes
+  lime_env_raw = np.where(
+      closed_basin_mask | (flat_mask & (E_norm < 0.4)),  # Flat, low areas only
+      gentle * (1.0 - E_norm),  # Gentle, low elevation
+      0.0  # Zero elsewhere
+  )
   
   sand_env_rock  = _normalize(sand_env_raw_rock)
   shale_env = _normalize(shale_env_raw)
@@ -1023,6 +1070,21 @@ def generate_stratigraphy(
   f_shale = T_shale / total_units
   f_lime  = T_lime  / total_units
 
+  # ========== BASIN GEOMETRY: WEDGE-THICKENING INTO BASINS ==========
+  # CRITICAL GEOLOGICAL RULE: Layers thicken into basins, thin over highs
+  # Reference: Principles of Sedimentology and Stratigraphy (Boggs) - accommodation space
+  # Use concavity to control thickness: thick in concave basins, thin on convex ridges
+  
+  # Thickness factor based on basin geometry
+  # Concave (basins): thickness factor > 1.0 (thicken)
+  # Convex (ridges): thickness factor < 1.0 (thin)
+  # Neutral: thickness factor = 1.0
+  basin_thickness_factor = 0.3 + 1.4 * basin_geometry  # Range: 0.3 (ridges) to 1.7 (basins)
+  ridge_thinning_factor = 0.2 + 0.8 * (1.0 - ridge_geometry)  # Thin on ridges
+  
+  # Combined thickness factor: thicken in basins, thin on ridges
+  accommodation_factor = basin_thickness_factor * ridge_thinning_factor
+  
   # Base thickness fields (trend) for each consolidated rock unit
   base_sandstone  = sed_total * f_sand  * (0.4 + 0.6 * sand_env_rock)
   base_shale_rock = sed_total * f_shale * (0.3 + 0.7 * shale_env)
@@ -1043,12 +1105,25 @@ def generate_stratigraphy(
   t_shale_trend = apply_variation(base_shale_rock, rnd_shale)
   t_lime_trend  = apply_variation(base_lime_rock,  rnd_lime)
 
+  # Apply basin geometry: thicken in basins, thin on ridges
+  t_sandstone_trend  = t_sandstone_trend  * accommodation_factor
+  t_shale_trend = t_shale_trend * accommodation_factor
+  t_lime_trend  = t_lime_trend  * accommodation_factor
+
   # Thin units on steep slopes (erosion), but maintain minimum thickness
   # Steep slopes erode more, preserving less sediment
   thin_factor = 0.3 + 0.7 * gentle  # 1.0 on gentle, 0.3 on steep
   t_sandstone  = t_sandstone_trend  * thin_factor
   t_shale_rock = t_shale_trend * thin_factor
-  t_lime_rock  = t_lime_trend  * thin_factor
+  
+  # Limestone: ONLY in flat, low-lying areas (shallow marine platforms)
+  # NOT in mountains or steep slopes
+  lime_restriction = np.where(
+      closed_basin_mask | (flat_mask & (E_norm < 0.4)),  # Flat, low areas only
+      1.0,  # Allow limestone
+      0.0   # Zero elsewhere (mountains, steep slopes)
+  )
+  t_lime_rock = t_lime_trend * thin_factor * lime_restriction
 
   # ========== STRATIGRAPHIC INTERFACE CALCULATION ==========
   # Enforce proper stacking: Topsoil → Sand/Silt → Clay → Gravel → Bedrock
@@ -1070,6 +1145,38 @@ def generate_stratigraphy(
   mountain_erosion_factor = np.where(mountain_mask, 0.3, 1.0)  # Mountains have less sediment
   lowland_sediment_factor = np.where(lowland_mask, 1.5, 1.0)   # Lowlands have more sediment
   
+  # ========== BASEMENT DEPTH ENFORCEMENT ==========
+  # CRITICAL GEOLOGICAL RULE: Basement should be deep (400m+) in basins,
+  # only shallow in mountain cores or heavily eroded uplifts
+  # Reference: USGS Crustal Structure Overview - basement typically kilometers deep
+  
+  # Determine if basement should be exposed (mountain cores, shield regions)
+  # Only expose basement where: high elevation AND steep slope AND convex (ridge)
+  expose_basement_mask = (E_norm > 0.7) & (slope_n > 0.6) & (convexity > 0.5)
+  
+  # Minimum basement depth based on terrain
+  # Basins: deep basement (400m+)
+  # Lowlands: moderate depth (200-400m)
+  # Mountains: shallow only in exposed cores (150m), otherwise deeper
+  min_basement_depth_basins = 400.0  # Deep in basins
+  min_basement_depth_lowlands = 250.0  # Moderate in lowlands
+  min_basement_depth_mountains = np.where(
+      expose_basement_mask,
+      150.0,  # Shallow only in exposed mountain cores
+      300.0   # Deeper in non-exposed mountain areas
+  )
+  
+  # Combine: use basin geometry to determine minimum depth
+  min_basement_depth = np.where(
+      basin_geometry > 0.6,  # Strong basin signal
+      min_basement_depth_basins,
+      np.where(
+          mountain_mask,
+          min_basement_depth_mountains,
+          min_basement_depth_lowlands
+      )
+  )
+  
   # Base reference depth for sedimentary layers
   # Deeper sediment stack under thicker crust (mountain belts), shallower under thinner crust
   # In mountains, basement is closer to surface due to erosion
@@ -1080,13 +1187,17 @@ def generate_stratigraphy(
       burial_depth_m * 1.5   # Lowlands: basement deep (sediment accumulation)
   )
   
+  # Ensure base_burial respects minimum basement depth
+  base_burial = np.maximum(base_burial, min_basement_depth)
+  
   top_sed_ref = (
       (Emean - base_burial)
       - 0.3 * crust_anom * elev_span * mountain_erosion_factor
       + bed_struct_weight * bed_struct_zm
   )
   
-  # Ensure sedimentary reference is well below surface
+  # Ensure sedimentary reference is well below surface AND respects minimum basement depth
+  top_sed_ref = np.minimum(top_sed_ref, E - min_basement_depth)
   top_sed_ref = np.minimum(top_sed_ref, E - 50.0)  # At least 50m below surface
 
   # ---------- 5) REGOLITH STACK ABOVE SEDIMENTARY LAYERS ----------
@@ -1095,15 +1206,29 @@ def generate_stratigraphy(
   # CRITICAL: All layers must be BELOW surface elevation E
   eps = 0.01
 
+  # ========== SLOPE-DEPENDENT REGOLITH THICKNESS ==========
+  # CRITICAL GEOLOGICAL RULE: Regolith thickness inversely related to slope
+  # Reference: USDA Soil Survey Manual - regolith rarely exceeds few meters on steep terrain
+  # Colluvium accumulates at hillslope bases, not peaks
+  
+  # Slope-dependent thickness factor: thin on steep slopes, thick on gentle
+  # Use exponential decay: thickness = max_thickness * exp(-slope_factor)
+  slope_decay_factor = np.exp(-slope_n * 3.0)  # Decay rapidly with slope
+  gentle_slope_factor = np.clip((0.3 - slope_n) / 0.3, 0.0, 1.0)  # Only on gentle slopes
+  
   # A and B horizons (Topsoil and Subsoil)
   # Topsoil thickness already accounts for slope (via soil_thickness_from_slope)
   # Further reduce topsoil on very steep slopes (cliffs, rock faces)
   steep_cliff_mask = slope_n > 0.7  # Very steep slopes (>70% normalized)
   topsoil_thick_adjusted = np.where(steep_cliff_mask, topsoil_thick * 0.1, topsoil_thick)
   
-  # In mountains, reduce regolith thickness (erosion dominates)
+  # Apply slope-dependent reduction
+  topsoil_thick_adjusted = topsoil_thick_adjusted * slope_decay_factor
+  subsoil_thick_adjusted = subsoil_thick * slope_decay_factor
+  
+  # In mountains, further reduce regolith thickness (erosion dominates)
   topsoil_thick_adjusted = topsoil_thick_adjusted * np.where(mountain_mask, 0.3, 1.0)
-  subsoil_thick_adjusted = subsoil_thick * np.where(mountain_mask, 0.3, 1.0)
+  subsoil_thick_adjusted = subsoil_thick_adjusted * np.where(mountain_mask, 0.3, 1.0)
   
   # Surface is E, all layers below it
   top_topsoil   = E
@@ -1111,9 +1236,16 @@ def generate_stratigraphy(
   top_colluvium = top_subsoil   - subsoil_thick_adjusted
 
   # Colluvium, saprolite, weathered rind
-  # In mountains, these are thinner or absent due to erosion
-  tC_adjusted = tC * np.where(mountain_mask, 0.2, 1.0)
-  tS_adjusted = tS * np.where(mountain_mask, 0.3, 1.0)
+  # CRITICAL: Colluvium only forms at slope breaks (mid-to-base of slopes), not peaks
+  # Use concavity to identify slope breaks (where colluvium accumulates)
+  colluvium_slope_factor = np.clip((0.4 - slope_n) / 0.4, 0.0, 1.0)  # Only on moderate slopes
+  colluvium_location_factor = concavity * colluvium_slope_factor  # At slope breaks
+  
+  tC_adjusted = tC * colluvium_location_factor * np.where(mountain_mask, 0.2, 1.0)
+  tC_adjusted = np.clip(tC_adjusted, 0.0, 20.0)  # Max 20m colluvium
+  
+  # Saprolite: thickest on gentle, stable interfluves
+  tS_adjusted = tS * gentle_slope_factor * np.where(mountain_mask, 0.3, 1.0)
   
   top_saprolite = top_colluvium - tC_adjusted
   top_rind      = top_saprolite - tS_adjusted
@@ -1182,8 +1314,18 @@ def generate_stratigraphy(
   # In mountains: reduce sedimentary thickness, expose igneous/metamorphic
   # In lowlands: thick sedimentary sequences
   
+  # ========== SANDSTONE LOCALIZATION ==========
+  # CRITICAL GEOLOGICAL RULE: Sandstone should be localized to depositional systems
+  # NOT everywhere - only in valleys, former deltas, or uplifted horizontal layers
+  # Reference: USGS Fluvial Sandstone Deposits
+  
+  # Sandstone restriction: reduce in high elevations and steep slopes
+  sandstone_elevation_factor = np.clip(1.0 - E_norm * 0.9, 0.1, 1.0)  # Reduce in high elevations
+  sandstone_slope_factor = np.clip(1.0 - slope_n * 0.7, 0.2, 1.0)  # Reduce on steep slopes
+  sandstone_restriction = sandstone_elevation_factor * sandstone_slope_factor
+  
   # Adjust sedimentary rock thickness based on terrain
-  t_sandstone_adjusted = t_sandstone * np.where(mountain_mask, 0.2, lowland_sediment_factor)
+  t_sandstone_adjusted = t_sandstone * np.where(mountain_mask, 0.2, lowland_sediment_factor) * sandstone_restriction
   t_shale_adjusted = t_shale_rock * np.where(mountain_mask, 0.2, lowland_sediment_factor)
   t_lime_adjusted = t_lime_rock * np.where(mountain_mask, 0.2, lowland_sediment_factor)
   
@@ -1205,22 +1347,32 @@ def generate_stratigraphy(
   # In mountains, reduce sedimentary package and bring basement/metamorphic closer
   mountain_sediment_reduction = np.where(mountain_mask, 0.1, 1.0)
   
-  # Calculate basement depth - deep in lowlands, shallow in mountains
-  # Basement should be hundreds of meters deep in lowlands
-  basement_depth_lowlands = burial_depth_m * 1.5  # ~180m in lowlands
-  basement_depth_mountains = burial_depth_m * 0.3  # ~36m in mountains (eroded)
+  # Calculate basement depth - deep in lowlands, shallow ONLY in exposed mountain cores
+  # CRITICAL: Use minimum basement depth calculated earlier
+  # Basement should be hundreds of meters deep in basins
+  basement_depth_lowlands = np.maximum(burial_depth_m * 1.5, min_basement_depth_lowlands)  # ~250m+ in lowlands
+  basement_depth_mountains = np.where(
+      expose_basement_mask,
+      min_basement_depth_mountains,  # Shallow only in exposed cores
+      min_basement_depth_mountains * 2.0  # Deeper in non-exposed mountain areas
+  )
   
   basement_depth = np.where(
       mountain_mask,
       basement_depth_mountains,
-      basement_depth_lowlands
+      np.maximum(basement_depth_lowlands, min_basement_depth)  # Use terrain-based minimum
   )
   
   top_basement_raw = top_limestone_raw - t_lime_adjusted
-  # Ensure basement is at appropriate depth
+  # CRITICAL: Ensure basement is at appropriate depth (respects minimum basement depth)
   top_basement_raw = np.minimum(
       top_basement_raw,
       E - basement_depth
+  )
+  # Additional constraint: basement must be at least min_basement_depth below surface
+  top_basement_raw = np.minimum(
+      top_basement_raw,
+      E - min_basement_depth
   )
   
   # Ensure consolidated rocks stay below unconsolidated sediments and respect ordering
@@ -1258,14 +1410,24 @@ def generate_stratigraphy(
   top_siltstone = top_mudstone - t_siltstone
   
   # Dolomite: carbonate platform
-  # In mountains: thin (eroded), but can be present
-  t_dolomite = np.where(mountain_mask, 5.0, 12.0) * lime_env * 0.3
+  # ONLY in flat, low-lying areas (shallow marine platforms)
+  # NOT in mountains or steep slopes
+  t_dolomite = np.where(
+      closed_basin_mask | (flat_mask & (E_norm < 0.4)),  # Flat, low areas only
+      np.where(mountain_mask, 0.0, 12.0) * lime_env * 0.3,  # Zero in mountains
+      0.0  # Zero elsewhere
+  )
   t_dolomite = np.clip(t_dolomite, 0.0, 50.0)  # Max constraint
   top_dolomite = top_siltstone - t_dolomite
   
-  # Evaporite: restricted basins
-  # In mountains: very thin or absent
-  t_evaporite = np.where(mountain_mask, 0.5, 8.0) * basins * 0.2
+  # Evaporite: ONLY in closed basins (flat, dry, enclosed basins with restricted drainage)
+  # CRITICAL: Evaporites require closed basins - NO outflow
+  # Reference: USGS Evaporite Basins - require flat, dry, enclosed basins
+  t_evaporite = np.where(
+      closed_basin_mask,  # ONLY in closed basins
+      np.where(mountain_mask, 0.0, 8.0) * basins * 0.2,  # Zero in mountains
+      0.0  # Zero elsewhere (including mountains, steep slopes, open basins)
+  )
   t_evaporite = np.clip(t_evaporite, 0.0, 20.0)  # Max constraint
   top_evaporite = top_dolomite - t_evaporite
   
