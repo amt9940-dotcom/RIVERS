@@ -1236,25 +1236,45 @@ def generate_stratigraphy(
   top_basement  = np.minimum(top_basement,  E - eps)
 
   # Add intermediate sedimentary layers with proper thickness
-  # Conglomerate: forms in high-energy settings, often in mountains
-  t_conglomerate = np.where(mountain_mask, 15.0, 10.0) * gravel_env
+  # In mountains: create varied sedimentary sequences (folded/thrust belts)
+  # Mountains can have: sandstone, shale, limestone in folded sequences
+  
+  # Conglomerate: forms in high-energy settings, often in mountain foothills
+  # In mountains: moderate thickness (alluvial fans, mountain-front deposits)
+  t_conglomerate = np.where(mountain_mask, 12.0, 10.0) * gravel_env
+  t_conglomerate = np.clip(t_conglomerate, 0.0, 50.0)  # Max constraint
   top_conglomerate = top_shale - t_conglomerate
   
   # Mudstone: fine-grained, deep basins
-  t_mudstone = np.where(mountain_mask, 5.0, 20.0) * clay_env
+  # In mountains: thin (eroded), but can be present in folded sequences
+  t_mudstone = np.where(mountain_mask, 8.0, 20.0) * clay_env
+  t_mudstone = np.clip(t_mudstone, 0.0, 40.0)  # Max constraint
   top_mudstone = top_conglomerate - t_mudstone
   
   # Siltstone: intermediate grain size
-  t_siltstone = np.where(mountain_mask, 5.0, 15.0) * silt_env
+  # In mountains: moderate thickness in sedimentary sequences
+  t_siltstone = np.where(mountain_mask, 10.0, 15.0) * silt_env
+  t_siltstone = np.clip(t_siltstone, 0.0, 30.0)  # Max constraint
   top_siltstone = top_mudstone - t_siltstone
   
   # Dolomite: carbonate platform
-  t_dolomite = np.where(mountain_mask, 3.0, 12.0) * lime_env * 0.3
+  # In mountains: thin (eroded), but can be present
+  t_dolomite = np.where(mountain_mask, 5.0, 12.0) * lime_env * 0.3
+  t_dolomite = np.clip(t_dolomite, 0.0, 50.0)  # Max constraint
   top_dolomite = top_siltstone - t_dolomite
   
   # Evaporite: restricted basins
-  t_evaporite = np.where(mountain_mask, 1.0, 8.0) * basins * 0.2
+  # In mountains: very thin or absent
+  t_evaporite = np.where(mountain_mask, 0.5, 8.0) * basins * 0.2
+  t_evaporite = np.clip(t_evaporite, 0.0, 20.0)  # Max constraint
   top_evaporite = top_dolomite - t_evaporite
+  
+  # Smooth intermediate layers to prevent spikes
+  top_conglomerate = _box_blur(top_conglomerate, k=3)
+  top_mudstone = _box_blur(top_mudstone, k=3)
+  top_siltstone = _box_blur(top_siltstone, k=3)
+  top_dolomite = _box_blur(top_dolomite, k=3)
+  top_evaporite = _box_blur(top_evaporite, k=3)
   
   # Ensure all intermediate layers are below surface and properly ordered
   top_conglomerate = np.minimum(top_conglomerate, E - eps)
@@ -1265,17 +1285,28 @@ def generate_stratigraphy(
 
   # ---------- 5b) CRYSTALLINE BASEMENT PARTITION WITH MOUNTAIN VARIETY ----------
   # Total crystalline column between the evaporites and the top of generic Basement
-  basement_total = np.maximum(top_evaporite - top_basement, 5.0)
-
-  # ========== MOUNTAIN LITHOLOGY: Expose Igneous/Metamorphic Rocks ==========
-  # In mountains: more granite, gneiss, schist exposed
-  # In lowlands: standard basement composition
+  # CRITICAL: Constrain basement_total to prevent spikes
+  basement_total_raw = top_evaporite - top_basement
+  # Maximum basement thickness: ~500m in lowlands, ~200m in mountains
+  max_basement_thick = np.where(mountain_mask, 200.0, 500.0)
+  basement_total = np.clip(np.maximum(basement_total_raw, 5.0), 5.0, max_basement_thick)
   
-  # Mountain rock type factors
+  # Smooth basement_total to prevent spikes
+  basement_total = _box_blur(basement_total, k=5)
+
+  # ========== REALISTIC MOUNTAIN LITHOLOGY WITH VERTICAL VARIETY ==========
+  # Mountains have varied vertical sequences:
+  # - Thin regolith (erosion)
+  # - Exposed bedrock layers: granite, gneiss, schist, folded sedimentary sequences
+  # - Layers should vary vertically, not just one type
+  
+  # Mountain rock type factors based on elevation and slope
   # High, steep mountains → more igneous (granite, diorite)
-  # Moderate mountains → metamorphic (gneiss, schist, slate)
+  # Moderate mountains → metamorphic (gneiss, schist)
+  # Lower mountain slopes → folded sedimentary sequences
   mountain_igneous_pref = np.clip((E_norm - 0.6) * (slope_n - 0.4) * 3.0, 0.0, 1.0)
   mountain_metamorphic_pref = np.clip(E_norm * slope_n * 2.0, 0.0, 1.0)
+  mountain_sedimentary_pref = np.clip((1.0 - E_norm) * slope_n * 1.5, 0.0, 1.0)  # Lower slopes
   
   # Base fractions from midcontinent function
   f_granite_base, f_gneiss_base, f_basalt_base, f_ancient_base = basement_fractions_midcontinent(
@@ -1285,53 +1316,92 @@ def generate_stratigraphy(
       rng
   )
   
-  # Adjust fractions in mountains to expose more igneous/metamorphic
-  # Mountains: more granite and gneiss, less basalt
+  # ========== MOUNTAIN LAYER VARIETY ==========
+  # Create varied vertical sequences in mountains:
+  # 1. Upper mountain (high elevation): Granite → Gneiss → Schist
+  # 2. Mid mountain: Gneiss → Schist → Folded sedimentary layers
+  # 3. Lower mountain: Folded sedimentary → Metamorphic → Granite
+  
+  # In mountains, create more varied fractions
+  # Upper mountains: more granite and gneiss
+  # Mid mountains: more gneiss and schist (metamorphic)
+  # Lower mountains: mix of sedimentary and metamorphic
+  
+  # Granite: more in high, steep mountains
   f_granite = np.where(
       mountain_mask,
-      f_granite_base * (1.0 + mountain_igneous_pref * 0.5),  # More granite in mountains
+      f_granite_base * (1.0 + mountain_igneous_pref * 0.8),  # More granite in high mountains
       f_granite_base
   )
+  
+  # Gneiss: common throughout mountains, especially mid-elevation
   f_gneiss = np.where(
       mountain_mask,
-      f_gneiss_base * (1.0 + mountain_metamorphic_pref * 0.6),  # More gneiss in mountains
+      f_gneiss_base * (1.0 + mountain_metamorphic_pref * 0.7),  # More gneiss in mountains
       f_gneiss_base
   )
+  
+  # Add Schist layer in mountains (metamorphic rock common in mountain belts)
+  # Schist forms from metamorphism of shale/mudstone
+  f_schist = np.where(
+      mountain_mask,
+      mountain_metamorphic_pref * 0.25,  # Up to 25% schist in mountains
+      0.05  # Small amount in lowlands
+  )
+  
+  # Basalt: less in mountains, more in lowlands
   f_basalt = np.where(
       mountain_mask,
-      f_basalt_base * 0.3,  # Less basalt in mountains
+      f_basalt_base * 0.2,  # Less basalt in mountains
       f_basalt_base
   )
+  
+  # Ancient crust: slightly less in mountains
   f_ancient = np.where(
       mountain_mask,
-      f_ancient_base * 0.8,  # Slightly less ancient crust in mountains
+      f_ancient_base * 0.7,  # Less ancient crust in mountains
       f_ancient_base
   )
   
-  # Normalize fractions to sum to reasonable total
-  total_frac = f_granite + f_gneiss + f_basalt + f_ancient
+  # Normalize fractions to sum to reasonable total (accounting for schist)
+  total_frac = f_granite + f_gneiss + f_schist + f_basalt + f_ancient
   scale = 0.85 / (total_frac + 1e-9)  # Target 85% of basement
   f_granite *= scale
   f_gneiss *= scale
+  f_schist *= scale
   f_basalt *= scale
   f_ancient *= scale
 
-  # Convert fractions into actual thicknesses (m)
-  t_granite = basement_total * f_granite
-  t_gneiss  = basement_total * f_gneiss
-  t_basalt  = basement_total * f_basalt
-  t_ancient = basement_total * f_ancient
+  # Convert fractions into actual thicknesses (m) with maximum constraints
+  # Constrain individual layer thicknesses to prevent spikes
+  max_layer_thick = np.where(mountain_mask, 150.0, 300.0)  # Max thickness per layer
+  
+  t_granite = np.clip(basement_total * f_granite, 0.0, max_layer_thick)
+  t_gneiss  = np.clip(basement_total * f_gneiss, 0.0, max_layer_thick)
+  t_schist  = np.clip(basement_total * f_schist, 0.0, max_layer_thick)
+  t_basalt  = np.clip(basement_total * f_basalt, 0.0, max_layer_thick)
+  t_ancient = np.clip(basement_total * f_ancient, 0.0, max_layer_thick)
+  
+  # Smooth thicknesses to prevent spikes
+  t_granite = _box_blur(t_granite, k=3)
+  t_gneiss = _box_blur(t_gneiss, k=3)
+  t_schist = _box_blur(t_schist, k=3)
+  t_basalt = _box_blur(t_basalt, k=3)
+  t_ancient = _box_blur(t_ancient, k=3)
 
   # Build interfaces top-down from the evaporites
+  # Create varied vertical stacking in mountains
   top_granite        = top_evaporite - t_granite
   top_gneiss         = top_granite  - t_gneiss
-  top_basalt         = top_gneiss   - t_basalt
+  top_schist         = top_gneiss   - t_schist
+  top_basalt         = top_schist   - t_basalt
   top_ancient_crust  = top_basalt   - t_ancient
   
   # Ensure all basement layers are below surface and properly ordered
   top_granite = np.minimum(top_granite, E - eps)
   top_gneiss = np.minimum(top_gneiss, top_granite - eps)
-  top_basalt = np.minimum(top_basalt, top_gneiss - eps)
+  top_schist = np.minimum(top_schist, top_gneiss - eps)
+  top_basalt = np.minimum(top_basalt, top_schist - eps)
   top_ancient_crust = np.minimum(top_ancient_crust, top_basalt - eps)
 
 
@@ -1387,6 +1457,17 @@ def generate_stratigraphy(
   # Order: Topsoil → Subsoil → Colluvium → Saprolite → WeatheredBR → 
   #        Sand/Silt → Clay → Gravel → Sandstone → Shale → Limestone → Basement
   
+  # CRITICAL: Add maximum thickness constraints to prevent spikes
+  # Maximum layer thicknesses (meters) to prevent unrealistic spikes
+  max_thickness = {
+      "Topsoil": 2.0, "Subsoil": 3.0, "Colluvium": 20.0, "Saprolite": 35.0, "WeatheredBR": 10.0,
+      "Sand": 35.0, "Silt": 25.0, "Clay": 30.0, "Gravel": 20.0,
+      "Sandstone": 150.0, "Conglomerate": 50.0, "Shale": 120.0, "Mudstone": 40.0,
+      "Siltstone": 30.0, "Limestone": 100.0, "Dolomite": 50.0, "Evaporite": 20.0,
+      "Granite": 200.0, "Gneiss": 200.0, "Schist": 150.0, "Basalt": 100.0,
+      "AncientCrust": 300.0, "Basement": 500.0
+  }
+  
   # Handle variable stacking: Sand can be above or below Clay depending on environment
   # Determine which is actually on top at each location
   sand_above_clay = top_sand > top_clay
@@ -1436,7 +1517,8 @@ def generate_stratigraphy(
 
       # Crystalline Units
       "Granite":       np.maximum(top_granite     - top_gneiss,          0.0),
-      "Gneiss":        np.maximum(top_gneiss      - top_basalt,          0.0),
+      "Gneiss":        np.maximum(top_gneiss      - top_schist,           0.0),
+      "Schist":        np.maximum(top_schist      - top_basalt,          0.0),
       "Basalt":        np.maximum(top_basalt      - top_ancient_crust,   0.0),
       "AncientCrust":  np.maximum(top_ancient_crust - top_basement,      0.0),
 
@@ -1444,6 +1526,16 @@ def generate_stratigraphy(
       "Basement":      np.maximum(top_basement    - top_basement_floor,  0.0),
       "BasementFloor": np.maximum(top_basement_floor - (top_basement_floor - 0.0), 0.0),
   }
+  
+  # Apply maximum thickness constraints to prevent spikes
+  for layer_name, max_thick in max_thickness.items():
+      if layer_name in thickness:
+          thickness[layer_name] = np.clip(thickness[layer_name], 0.0, max_thick)
+  
+  # Smooth thicknesses to prevent sharp spikes
+  for layer_name in thickness:
+      if layer_name not in ["BasementFloor"]:  # Don't smooth the floor
+          thickness[layer_name] = _box_blur(thickness[layer_name], k=3)
 
 
   interfaces = {
@@ -1473,6 +1565,7 @@ def generate_stratigraphy(
       # Crystalline Units
       "Granite":       top_granite,
       "Gneiss":        top_gneiss,
+      "Schist":        top_schist,
       "Basalt":        top_basalt,
       "AncientCrust":  top_ancient_crust,
 
@@ -1683,6 +1776,13 @@ def generate_stratigraphy(
           "porosity":    0.01,
           "K_rel":       0.16,
       },
+      "Schist": {
+          # Metamorphic rock common in mountain belts; foliated, can be erodible
+          "erodibility": 0.20,
+          "density":     2700,
+          "porosity":    0.02,
+          "K_rel":       0.20,
+      },
       "Basalt": {
           # dense mafic volcanic; often forms very resistant flows
           "erodibility": 0.12,
@@ -1784,6 +1884,7 @@ def compute_top_material_map(strata, min_thick=0.05):
         # Crystalline/metamorphic
         "Granite",
         "Gneiss",
+        "Schist",
         "Basalt",
         "AncientCrust",
 
@@ -2005,6 +2106,7 @@ def plot_cross_section(strata, row=None, col=None, min_draw_thickness=0.05, ax=N
         # crystalline/metamorphic
         "Granite",
         "Gneiss",
+        "Schist",
         "Basalt",
         "AncientCrust",
 
@@ -2037,6 +2139,7 @@ def plot_cross_section(strata, row=None, col=None, min_draw_thickness=0.05, ax=N
 
         "Granite":      "lightpink",
         "Gneiss":       "violet",
+        "Schist":       "mediumpurple",
         "Basalt":       "royalblue",
         "AncientCrust": "darkseagreen",
 
