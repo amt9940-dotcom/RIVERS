@@ -731,46 +731,42 @@ def dune_thickness_field(
 # ---------------- Enhanced topographic analysis for geological rules ----------------
 def compute_flow_accumulation(surface_elev, pixel_scale_m):
     """
-    Compute flow accumulation using D8 flow routing.
-    Returns accumulation array (number of upstream cells draining to each cell).
+    Compute flow accumulation using fast approximation.
+    Uses topographic wetness index (TWI) approximation instead of full D8 routing.
+    Returns accumulation array (approximate upstream contributing area).
     """
     ny, nx = surface_elev.shape
-    accumulation = np.ones((ny, nx), dtype=float)
     
-    # D8 directions: [N, NE, E, SE, S, SW, W, NW]
-    dx = [0, 1, 1, 1, 0, -1, -1, -1]
-    dy = [-1, -1, 0, 1, 1, 1, 0, -1]
+    # Fast approximation: use inverse of local slope as proxy for accumulation
+    # Areas with low slope and concave curvature accumulate more flow
+    dEx, dEy = np.gradient(surface_elev, pixel_scale_m, pixel_scale_m)
+    slope_mag = np.sqrt(dEx**2 + dEy**2) + 1e-6
     
-    # Sort cells by elevation (highest first) for efficient routing
-    flat_indices = np.arange(ny * nx)
-    elevations_flat = surface_elev.flatten()
-    sorted_indices = np.argsort(-elevations_flat)  # descending
+    # Compute curvature (Laplacian) - concave areas accumulate flow
+    d2x, _ = np.gradient(dEx)
+    _, d2y = np.gradient(dEy)
+    curvature = d2x + d2y
     
-    # Route flow from high to low
-    for idx in sorted_indices:
-        r = idx // nx
-        c = idx % nx
-        
-        # Find steepest descent direction
-        min_slope = 0.0
-        best_dir = -1
-        
-        for d in range(8):
-            nr = r + dy[d]
-            nc = c + dx[d]
-            
-            if 0 <= nr < ny and 0 <= nc < nx:
-                slope = (surface_elev[r, c] - surface_elev[nr, nc]) / (pixel_scale_m * np.sqrt(2 if d % 2 == 1 else 1))
-                if slope > min_slope:
-                    min_slope = slope
-                    best_dir = d
-        
-        # Route accumulation to downstream cell
-        if best_dir >= 0:
-            nr = r + dy[best_dir]
-            nc = c + dx[best_dir]
-            if 0 <= nr < ny and 0 <= nc < nx:
-                accumulation[nr, nc] += accumulation[r, c]
+    # Topographic wetness index approximation
+    # TWI ≈ ln(catchment_area / slope)
+    # We approximate catchment_area using smoothed inverse slope
+    # and curvature (concave = positive catchment)
+    
+    # Smooth the inverse slope to approximate contributing area
+    inv_slope = 1.0 / slope_mag
+    k_smooth = max(5, int(0.08 * min(ny, nx)) | 1)
+    catchment_approx = _box_blur(inv_slope, k=k_smooth)
+    
+    # Enhance in concave areas (valleys)
+    concave = np.maximum(curvature, 0.0)
+    concave_norm = _normalize(concave)
+    catchment_approx = catchment_approx * (1.0 + 2.0 * concave_norm)
+    
+    # Normalize to get accumulation-like values
+    accumulation = _normalize(catchment_approx) * (ny * nx * 0.1)  # Scale to reasonable range
+    
+    # Add base value (every cell gets at least 1)
+    accumulation = accumulation + 1.0
     
     return accumulation
 
@@ -799,40 +795,46 @@ def detect_closed_basins(surface_elev, pixel_scale_m):
     """
     Detect closed topographic depressions (sinks).
     Returns boolean mask: True where closed basins exist.
+    Fast vectorized version.
     """
     ny, nx = surface_elev.shape
     
-    # Simple approach: find local minima that are lower than all neighbors
-    # and have no drainage outlet
+    # Fast approximation: use flow accumulation and local minima detection
     flow_accum = compute_flow_accumulation(surface_elev, pixel_scale_m)
     
-    # Cells with very low flow accumulation that are local minima
-    local_min = np.zeros((ny, nx), dtype=bool)
-    for r in range(1, ny-1):
-        for c in range(1, nx-1):
-            center = surface_elev[r, c]
-            neighbors = [
-                surface_elev[r-1, c], surface_elev[r+1, c],
-                surface_elev[r, c-1], surface_elev[r, c+1],
-                surface_elev[r-1, c-1], surface_elev[r-1, c+1],
-                surface_elev[r+1, c-1], surface_elev[r+1, c+1]
-            ]
-            if center < min(neighbors):
-                local_min[r, c] = True
+    # Vectorized local minima detection using rolling operations
+    # A cell is a local minimum if it's lower than all 8 neighbors
+    z = surface_elev
+    
+    # Check all 8 neighbors using roll operations
+    is_min = np.ones_like(z, dtype=bool)
+    
+    # 4-connected neighbors
+    is_min = is_min & (z < np.roll(z, -1, axis=0))  # North
+    is_min = is_min & (z < np.roll(z,  1, axis=0))  # South
+    is_min = is_min & (z < np.roll(z,  1, axis=1))  # West
+    is_min = is_min & (z < np.roll(z, -1, axis=1))  # East
+    
+    # Diagonal neighbors
+    is_min = is_min & (z < np.roll(np.roll(z, -1, axis=0), -1, axis=1))  # NE
+    is_min = is_min & (z < np.roll(np.roll(z, -1, axis=0),  1, axis=1))  # NW
+    is_min = is_min & (z < np.roll(np.roll(z,  1, axis=0), -1, axis=1))  # SE
+    is_min = is_min & (z < np.roll(np.roll(z,  1, axis=0),  1, axis=1))  # SW
+    
+    # Set edges to False (can't be local minima at boundaries)
+    is_min[0, :] = False
+    is_min[-1, :] = False
+    is_min[:, 0] = False
+    is_min[:, -1] = False
     
     # Closed basins: local minima with low flow accumulation
     low_flow = flow_accum < np.percentile(flow_accum, 10)
-    closed_basins = local_min & low_flow
+    closed_basins = is_min & low_flow
     
-    # Expand slightly to include basin floors
-    from scipy.ndimage import binary_dilation
-    try:
-        closed_basins = binary_dilation(closed_basins, structure=np.ones((5, 5)))
-    except:
-        # Fallback if scipy not available
-        closed_basins = _box_blur(closed_basins.astype(float), k=5) > 0.3
+    # Expand slightly to include basin floors (vectorized)
+    closed_basins = _box_blur(closed_basins.astype(float), k=5) > 0.3
     
-    return closed_basins
+    return closed_basins.astype(bool)
 
 
 def classify_geomorphic_zones(surface_elev, pixel_scale_m, 
@@ -888,17 +890,31 @@ def classify_geomorphic_zones(surface_elev, pixel_scale_m,
     # Moderate slope, but adjacent to steep upslope terrain
     moderate_slope = (slope_mag >= fan_min) & (slope_mag <= fan_max)
     
-    # Check if upslope neighbors are steep
-    aspect = topo["aspect"]  # downslope direction
+    # Fast approximation: check if there are steep slopes in upslope direction
+    # Use a neighborhood check instead of exact upslope direction
+    # Create a mask for steep slopes
+    steep_mask = slope_mag > steep_thresh
+    
+    # Check if any neighbors in a small upslope-oriented window are steep
+    # Simplified: check if there are steep slopes in a 3x3 neighborhood above current cell
+    # (upslope is generally in the direction opposite to aspect, but we'll use a simple neighborhood)
     upslope_steep = np.zeros_like(surface_elev, dtype=bool)
-    for r in range(1, surface_elev.shape[0]-1):
-        for c in range(1, surface_elev.shape[1]-1):
-            # Check neighbors in upslope direction
-            up_r = r - int(np.sin(aspect[r, c]) * 2)
-            up_c = c - int(np.cos(aspect[r, c]) * 2)
-            if 0 <= up_r < surface_elev.shape[0] and 0 <= up_c < surface_elev.shape[1]:
-                if slope_mag[up_r, up_c] > steep_thresh:
-                    upslope_steep[r, c] = True
+    
+    # Fast vectorized approach: check if steep slopes exist in upper half of neighborhood
+    # Roll operations to check neighbors
+    steep_n = np.roll(steep_mask, -1, axis=0)  # North
+    steep_ne = np.roll(np.roll(steep_mask, -1, axis=0), -1, axis=1)  # Northeast
+    steep_nw = np.roll(np.roll(steep_mask, -1, axis=0), 1, axis=1)  # Northwest
+    
+    # A cell has steep upslope if any of the northern neighbors are steep
+    upslope_steep = steep_n | steep_ne | steep_nw
+    
+    # Also check if current cell is at base of a steep slope (elevation gradient)
+    # Cells that are lower than their northern neighbors and those neighbors are steep
+    z_n = np.roll(surface_elev, -1, axis=0)
+    at_base_of_steep = (surface_elev < z_n) & steep_n
+    
+    upslope_steep = upslope_steep | at_base_of_steep
     
     fan_toes = moderate_slope & upslope_steep & (local_relief_norm > 0.3)
     
