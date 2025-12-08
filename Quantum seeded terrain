@@ -1643,144 +1643,181 @@ def generate_stratigraphy(
 
 
     # ================================================================
-    # SIMPLIFIED GEOLOGIC STRATIGRAPHY
+    # CORRECT GEOLOGIC STRATIGRAPHY
     # ================================================================
-    # KEY CHANGES from previous approach:
-    # 1. BASIN FIELD drives everything - strong basin vs high contrast
-    # 2. Sandstone is FACIES-SPECIFIC, not a uniform blanket
-    # 3. Basement is SMOOTHED (wide blur), not noisy spikes
-    # 4. EROSION PEEL strips layers from highs
-    # 5. Simpler rules, more geologic results
+    # THE KEY INSIGHT:
+    #   basin_capacity = (surface - regolith) - basement_top
+    #   This capacity gets filled with SEDIMENTS, not basalt!
+    #
+    # Basalt/crystalline rocks are NOT a default fill layer.
+    # They should only appear:
+    #   1. As the basement foundation (granite/gneiss)
+    #   2. As rare volcanic flows in specific provinces
+    #
+    # Mountains = erosional highs that expose basement through thin sediment
+    # Basins = thick sedimentary fill hiding basement deep below
     # ================================================================
 
     elev_span = float(E.max() - E.min() + 1e-9)
     
-    # (basin_field and high_field already defined earlier)
+    # ================================================================
+    # STEP 1: COMPUTE BASEMENT TOP (deep under basins, shallow under mountains)
+    # ================================================================
+    # Basement is the crystalline foundation (granite/gneiss).
+    # It should be:
+    #   - DEEP under basins (lots of sediment accommodation)
+    #   - SHALLOW under mountains (erosion has removed sediment, exposing basement)
+    
+    # Basement depth is controlled by basin_field
+    basement_min_depth = 50.0    # Minimum depth below surface (on eroded peaks)
+    basement_max_depth = 800.0   # Maximum depth below surface (in deep basins)
+    
+    # Basement depth below surface
+    basement_depth = basement_min_depth + (basement_max_depth - basement_min_depth) * basin_field
+    
+    # Mountains can have basement even closer to surface due to erosion
+    erosion_exposure = high_field * slope_n * E_norm  # Where erosion exposes basement
+    basement_depth = basement_depth * (1.0 - 0.8 * erosion_exposure)
+    basement_depth = np.maximum(basement_depth, 20.0)  # Minimum 20m
+    basement_depth = _box_blur(basement_depth, k=31)   # Smooth basement surface
+    
+    # Top of basement elevation
+    top_basement_raw = E - basement_depth
+    top_basement_raw = _box_blur(top_basement_raw, k=21)
     
     # ================================================================
-    # STEP 2: EROSION DEPTH (peels layers from highs)
+    # STEP 2: COMPUTE BASIN CAPACITY (space for sediments)
     # ================================================================
-    # How much material has been eroded at each point?
-    # High + steep = maximum erosion
-    # Basin + flat = minimum erosion
-    #
-    # This breaks the "uniform cake" by exposing deeper units on highs
+    # basin_capacity = (surface - regolith) - basement_top
+    # This is the space available for sedimentary rocks
     
-    erosion_depth = (
-        150.0 * E_norm +              # Higher = more erosion
-        100.0 * slope_n +             # Steeper = more erosion
-        50.0 * high_field             # On highs = more erosion
+    # Estimate regolith thickness first (will refine later)
+    regolith_estimate = 10.0 + 30.0 * (1.0 - slope_n)  # Thick on gentle, thin on steep
+    regolith_estimate = _box_blur(regolith_estimate, k=11)
+    
+    # Rock surface (below regolith)
+    rock_surface = E - regolith_estimate
+    
+    # Basin capacity = space between rock surface and basement
+    basin_capacity = np.maximum(rock_surface - top_basement_raw, 10.0)
+    basin_capacity = _box_blur(basin_capacity, k=15)
+    
+    # ================================================================
+    # STEP 3: FILL BASIN CAPACITY WITH SEDIMENTS (not basalt!)
+    # ================================================================
+    # The capacity gets filled with a sedimentary sequence.
+    # Facies vary by position:
+    #   - Basin centers: shale, mudstone, limestone
+    #   - Basin margins: sandstone, siltstone
+    #   - Near highlands: conglomerate, sandstone
+    #   - On highlands: thin or no sediment
+    
+    # Total sediment = basin_capacity (we fill it all with sediment)
+    sed_total = basin_capacity
+    
+    # ================================================================
+    # STEP 4: PARTITION SEDIMENTS BY FACIES ENVIRONMENT
+    # ================================================================
+    
+    # --- SHALE/MUDSTONE (dominant BASIN CENTER fill) ---
+    # Forms in quiet water: deep basins, lakes, offshore
+    # This is THE MAIN basin fill material
+    shale_environment = np.clip(
+        0.6 * basin_field +           # Strong in basins
+        0.3 * (1.0 - slope_n) +       # Flat areas
+        0.1 * (1.0 - E_norm),         # Low areas
+        0.0, 1.0
     )
-    erosion_depth = _box_blur(erosion_depth, k=11)  # Smooth erosion field
+    # Reduce on highlands
+    shale_environment = np.where(high_field > 0.6, shale_environment * 0.1, shale_environment)
+    shale_environment = _box_blur(shale_environment, k=21)
     
-    # In basins, erosion is minimal
-    erosion_depth = erosion_depth * (0.1 + 0.9 * high_field)
+    shale_fraction = shale_environment * 0.6  # Up to 60% of basin fill is shale/mud
     
-    # ================================================================
-    # STEP 3: TOTAL SEDIMENT THICKNESS (basin-controlled)
-    # ================================================================
-    # Simple rule: sed_total = sed_min + sed_range * basin_field
-    # Basins get THICK fill, highs get THIN drape
+    # --- SANDSTONE (basin MARGINS and channels, NOT everywhere) ---
+    # Forms at basin margins, in channels, at shorelines
+    # Should be ZERO in basin centers and on bare highlands
     
-    sed_min_m = 30.0       # Minimum sediment on highest peaks
-    sed_max_m = 400.0      # Maximum sediment in deepest basins
-    
-    # Total pre-erosion sediment thickness
-    sed_total_pre = sed_min_m + (sed_max_m - sed_min_m) * basin_field
-    
-    # Apply erosion - highs lose sediment
-    sed_total = np.maximum(sed_total_pre - erosion_depth, 10.0)
-    
-    # Smooth the total to avoid pixel-scale variations
-    sed_total = _box_blur(sed_total, k=15)
-    
-    # ================================================================
-    # STEP 4: PARTITION SEDIMENTS INTO FEW MAJOR UNITS
-    # ================================================================
-    # Keep it simple: 3-4 major sedimentary units, not 8+
-    # Each unit has a FACIES ENVIRONMENT that controls WHERE it exists
-    
-    # --- SHALE/MUDSTONE (dominant basin fill) ---
-    # Forms in quiet water: basin centers, lakes, offshore
-    # This should be the MAIN basin fill, not sandstone
-    shale_fraction = np.clip(
-        0.5 * basin_field +           # Basins = shale-dominated
-        0.3 * (1.0 - slope_n) +       # Flat = shale
-        0.2 * (1.0 - E_norm),         # Low = shale
-        0.1, 0.8
-    )
-    shale_fraction = _box_blur(shale_fraction, k=21)  # Smooth facies boundaries
-    # (actual thickness computed later after all fractions defined)
-    
-    # --- SANDSTONE (facies-specific, NOT a blanket) ---
-    # Forms ONLY in specific environments:
-    # 1. Channels/rivers (drainage)
-    # 2. Basin MARGINS (not centers)
-    # 3. Shorelines/deltas
-    # Should be ZERO in many places
+    basin_margin = 4.0 * basin_field * (1.0 - basin_field)  # Peak where basin=0.5
+    basin_margin = _normalize(basin_margin)
     
     # Drainage proxy for channels
     catch = _box_blur(1.0 - slope_n, k=9)
-    drainage_proxy = _normalize(catch - slope_n * 0.5)
+    drainage_proxy = _normalize(catch - slope_n * 0.3)
     
-    # Basin margin = intermediate basin_field values
-    basin_margin = 4.0 * basin_field * (1.0 - basin_field)  # Peak at 0.5
-    
-    # Sandstone forms in channels OR at basin margins, NOT everywhere
     sand_environment = np.clip(
-        0.5 * drainage_proxy * (1.0 - basin_field) +  # Channels on highs
-        0.4 * basin_margin +                           # Basin margins
-        0.1 * slope_n * (1.0 - basin_field),          # Some on slopes
+        0.5 * basin_margin +                  # Basin margins
+        0.3 * drainage_proxy +                # Channels
+        0.2 * slope_n * (1.0 - basin_field),  # Slopes near highlands
         0.0, 1.0
     )
-    # KEY: Set sandstone to ZERO in deep basins and on flat basin floors
-    sand_environment = np.where(basin_field > 0.7, sand_environment * 0.1, sand_environment)
-    sand_environment = np.where((basin_field > 0.5) & (slope_n < 0.15), sand_environment * 0.2, sand_environment)
+    # ZERO in deep basin centers
+    sand_environment = np.where(basin_field > 0.75, sand_environment * 0.05, sand_environment)
+    # ZERO on bare highlands (no sediment source there)
+    sand_environment = np.where(high_field > 0.7, sand_environment * 0.2, sand_environment)
     sand_environment = _box_blur(sand_environment, k=15)
     
-    sand_fraction = sand_environment * 0.4  # Max 40% of column is sandstone
-    t_sandstone = sed_total * sand_fraction
+    sand_fraction = sand_environment * 0.3  # Up to 30% of fill
     
-    # --- LIMESTONE (only in interior basins, gentle platform) ---
-    # Forms in warm, clear, shallow water - restricted areas
+    # --- SILTSTONE (transitional, distal fans) ---
+    silt_environment = np.clip(
+        0.5 * basin_margin +
+        0.3 * (1.0 - np.abs(basin_field - 0.5) * 2) +  # Transitional zones
+        0.2 * (1.0 - slope_n),
+        0.0, 1.0
+    )
+    silt_environment = _box_blur(silt_environment, k=15)
+    silt_fraction = silt_environment * 0.2  # Up to 20%
+    
+    # --- CONGLOMERATE (mountain fronts, alluvial fans) ---
+    # Forms ONLY at base of steep slopes - alluvial fans
+    slope_break = np.abs(np.gradient(slope_n)[0]) + np.abs(np.gradient(slope_n)[1])
+    slope_break = _normalize(slope_break)
+    
+    cong_environment = np.clip(
+        slope_n * high_field * slope_break * 3.0,  # Where steep meets flat
+        0.0, 1.0
+    )
+    cong_environment = _box_blur(cong_environment, k=11)
+    cong_fraction = cong_environment * 0.15  # Up to 15%
+    
+    # --- LIMESTONE (interior flat basins only) ---
     lime_environment = np.where(
-        (basin_field > 0.6) & (slope_n < 0.1),  # Deep flat basins only
+        (basin_field > 0.65) & (slope_n < 0.08),  # Flat basin interiors
         0.5 + 0.5 * basin_field,
         0.0
     )
+    lime_environment = np.where(high_field > 0.4, 0.0, lime_environment)  # Never on highlands
     lime_environment = _box_blur(lime_environment, k=21)
-    lime_fraction = lime_environment * 0.25  # Max 25% of column
+    lime_fraction = lime_environment * 0.2  # Up to 20%
+    
+    # --- Normalize fractions so they sum to <= 1 ---
+    total_fraction = shale_fraction + sand_fraction + silt_fraction + cong_fraction + lime_fraction
+    scale = np.where(total_fraction > 0.95, 0.95 / (total_fraction + 1e-9), 1.0)
+    
+    shale_fraction = shale_fraction * scale
+    sand_fraction = sand_fraction * scale
+    silt_fraction = silt_fraction * scale
+    cong_fraction = cong_fraction * scale
+    lime_fraction = lime_fraction * scale
+    
+    # --- Compute actual thicknesses ---
+    t_shale_total = sed_total * shale_fraction
+    t_shale_rock = t_shale_total * 0.55   # Shale proper
+    t_mudstone = t_shale_total * 0.45     # Mudstone
+    
+    t_sandstone = sed_total * sand_fraction
+    t_siltstone_rock = sed_total * silt_fraction
+    t_conglomerate = sed_total * cong_fraction
     t_limestone_rock = sed_total * lime_fraction
     
-    # --- CONGLOMERATE (mountain fronts only) ---
-    # Forms at alluvial fans, proximal to source
-    cong_environment = np.clip(
-        slope_n * high_field * 2.0,  # Steep slopes on highs
-        0.0, 1.0
-    )
-    # Only where slopes meet flats (alluvial fan apex)
-    slope_gradient = np.abs(np.gradient(slope_n)[0]) + np.abs(np.gradient(slope_n)[1])
-    cong_environment = cong_environment * _normalize(slope_gradient)
-    cong_environment = _box_blur(cong_environment, k=11)
-    cong_fraction = cong_environment * 0.15  # Max 15%
-    t_conglomerate = sed_total * cong_fraction
+    # Dolomite - minor, only in restricted basins
+    t_dolomite_rock = t_limestone_rock * 0.25 * np.where(basin_field > 0.7, 1.0, 0.1)
     
-    # Compute thickness for each unit
-    # Shale is the main basin fill
-    t_shale_total = sed_total * shale_fraction
-    t_shale_rock = t_shale_total * 0.6  # Shale proper
-    t_mudstone = t_shale_total * 0.4    # Mudstone (finer)
-    
-    # Remaining after major units goes to siltstone
-    used_fraction = shale_fraction + sand_fraction + lime_fraction + cong_fraction
-    remaining = np.clip(1.0 - used_fraction, 0.05, 0.3)
-    t_siltstone_rock = sed_total * remaining
-    
-    # Dolomite and evaporite - only in very restricted settings
-    t_dolomite_rock = t_limestone_rock * 0.3 * np.where(basin_field > 0.7, 1.0, 0.1)
+    # Evaporite - rare, only in very restricted settings
     t_evaporite_rock = np.where(
-        (basin_field > 0.85) & (slope_n < 0.05),
-        sed_total * 0.03,
+        (basin_field > 0.85) & (slope_n < 0.04),
+        sed_total * 0.02,
         np.zeros_like(sed_total)
     )
 
@@ -1837,87 +1874,130 @@ def generate_stratigraphy(
     top_basement_floor = np.full_like(top_basement, z_floor)
     
     # ================================================================
-    # STEP 6: SIMPLIFIED CRYSTALLINE BASEMENT
+    # STEP 5: CRYSTALLINE BASEMENT (foundation, NOT a fill layer)
     # ================================================================
-    # KEY: Collapse into few smooth layers, not noisy partitions
-    # Wide smoothing on all crystalline boundaries
+    # The basement is the crystalline foundation under everything.
+    # It consists of granite and gneiss (metamorphic/igneous basement).
+    #
+    # KEY INSIGHT: Basement is NOT a fill layer. It's the FLOOR.
+    # Everything else (sediments, regolith) sits ON TOP of basement.
+    #
+    # Basalt is NOT a continuous layer. It's RARE volcanic material:
+    #   - Thin flows at specific volcanic provinces
+    #   - Or completely absent in most areas
     
-    # Total crystalline column (smooth)
-    crystalline_thickness = _box_blur(
-        150.0 + 100.0 * high_field,  # Thicker under highs
-        k=31  # Wide smoothing!
-    )
+    # Basement composition: Granite (upper basement) and Gneiss (lower basement)
+    # Plus deep "AncientCrust" at the very bottom
     
-    # Simple partition: 3 zones, heavily smoothed
-    # Deep: AncientCrust (bottom 30%)
-    # Middle: Gneiss/Basalt mix (middle 40%)  
-    # Upper: Granite (top 30%)
+    # Total crystalline basement thickness (below top_basement)
+    basement_total_thickness = 200.0 + 100.0 * np.random.rand(*E.shape)
+    basement_total_thickness = _box_blur(basement_total_thickness, k=31)
     
-    f_ancient = 0.30
-    f_middle = 0.40  # Will be split between gneiss and basalt
-    f_granite_top = 0.30
+    # Partition basement (from top_basement DOWN to BasementFloor)
+    # Upper 40%: Granite
+    # Middle 40%: Gneiss  
+    # Lower 20%: AncientCrust
+    t_granite_basement = basement_total_thickness * 0.4
+    t_gneiss_basement = basement_total_thickness * 0.4
+    t_ancient_basement = basement_total_thickness * 0.2
     
-    # Basalt is rare - only in some areas (rift zones)
-    basalt_zone = _box_blur(basin_field * 0.3, k=41)  # Smooth, rare
-    f_basalt = f_middle * basalt_zone
-    f_gneiss = f_middle * (1.0 - basalt_zone)
+    # Build interfaces from top_basement_raw DOWN
+    # top_basement_raw is top of basement (computed in Step 1)
+    # These are BELOW the sediments, not above them
     
-    # Compute thicknesses (all smooth due to crystalline_thickness being smooth)
-    t_ancient_cryst = crystalline_thickness * f_ancient
-    t_gneiss_cryst = crystalline_thickness * f_gneiss
-    t_basalt_cryst = crystalline_thickness * f_basalt
-    t_granite_cryst = crystalline_thickness * f_granite_top
+    # Top of granite = top of basement (granite is uppermost crystalline)
+    top_granite = top_basement_raw
+    top_gneiss = top_granite - t_granite_basement
+    top_ancient_crust = top_gneiss - t_gneiss_basement
+    bottom_basement = top_ancient_crust - t_ancient_basement
     
-    # Build interfaces from basement UP
-    top_ancient_crust = top_basement + t_ancient_cryst
-    top_basalt = top_ancient_crust + np.maximum(t_basalt_cryst, 1.0)  # Min 1m
-    top_gneiss = top_basalt + t_gneiss_cryst
-    top_granite = top_gneiss + t_granite_cryst
-    
-    # Smooth all crystalline interfaces
-    top_ancient_crust = _box_blur(top_ancient_crust, k=21)
-    top_basalt = _box_blur(top_basalt, k=21)
-    top_gneiss = _box_blur(top_gneiss, k=21)
+    # Smooth all interfaces
     top_granite = _box_blur(top_granite, k=21)
+    top_gneiss = _box_blur(top_gneiss, k=21)
+    top_ancient_crust = _box_blur(top_ancient_crust, k=21)
+    bottom_basement = _box_blur(bottom_basement, k=21)
+    
+    # BASALT: RARE volcanic flows, NOT a continuous layer
+    # Only present in specific volcanic provinces (random patches)
+    # Appears as THIN flows WITHIN the sediment package or at surface
+    volcanic_province = np.random.rand(*E.shape)
+    volcanic_province = _box_blur(volcanic_province, k=41)
+    volcanic_province = np.where(volcanic_province > 0.75, (volcanic_province - 0.75) * 4, 0.0)
+    
+    # Basalt thickness: 0 in most places, thin flows where present
+    t_basalt_flow = volcanic_province * 30.0  # Max 30m where present
+    t_basalt_flow = _box_blur(t_basalt_flow, k=21)
     
     # ================================================================
-    # STEP 7: BUILD SEDIMENT STACK WITH EROSION PEEL
+    # STEP 6: BUILD SEDIMENT STACK ON TOP OF BASEMENT
     # ================================================================
-    # Build from basement UP, then PEEL from top DOWN based on erosion
-    # This is what creates exposed deeper units on highs
+    # CORRECT ORDER (bottom to top):
+    #   Basement (granite) → Sediments → Regolith → Surface
+    #
+    # Build sediments from basement top UPWARD to rock surface
+    # Older sediments at bottom, younger at top
+    #
+    # Stratigraphic order (bottom to top):
+    #   Evaporite (oldest, deepest)
+    #   Limestone/Dolomite
+    #   Shale/Mudstone (main basin fill)
+    #   Siltstone
+    #   Sandstone (channels, margins)
+    #   Conglomerate (youngest, near surface)
+    #   [Basalt flows interbedded where present]
     
-    # Build full pre-erosion stack from crystalline top upward
-    # Order: Evaporite → Limestone/Dolomite → Shale → Siltstone → Sandstone → Conglomerate
-    top_evaporite_pre = top_granite + t_evaporite_rock
-    top_dolomite_pre = top_evaporite_pre + t_dolomite_rock
-    top_limestone_pre = top_dolomite_pre + t_limestone_rock
-    top_shale_pre = top_limestone_pre + t_shale_rock  # t_shale_rock is 60% of total shale
-    top_mudstone_pre = top_shale_pre + t_mudstone     # t_mudstone is 40% of total shale
-    top_siltstone_pre = top_mudstone_pre + t_siltstone_rock
-    top_sandstone_pre = top_siltstone_pre + t_sandstone
-    top_conglomerate_pre = top_sandstone_pre + t_conglomerate
+    # Build from basement (top_granite) UPWARD
+    # Note: top_granite is the top of the crystalline basement
     
-    # The pre-erosion surface would be at top_conglomerate_pre
-    # But erosion has removed material, so actual surface is at E
-    # The difference is erosion_depth (already calculated)
+    top_evaporite = top_granite + t_evaporite_rock
+    top_dolomite = top_evaporite + t_dolomite_rock
+    top_limestone = top_dolomite + t_limestone_rock
+    top_shale = top_limestone + t_shale_rock
+    top_mudstone = top_shale + t_mudstone
+    top_siltstone = top_mudstone + t_siltstone_rock
     
-    # Apply erosion peel: rock tops cannot exceed (surface - regolith)
-    # This ensures deeper units are exposed where erosion is high
-    rock_surface_limit = E - (topsoil_thick + subsoil_thick + tC + tS + tR)
+    # Insert basalt flows (where present) between siltstone and sandstone
+    top_basalt = top_siltstone + t_basalt_flow
     
-    # Peel each layer - they can't exceed the rock surface limit
-    # Smooth to avoid jagged contacts
-    top_conglomerate = np.minimum(top_conglomerate_pre, rock_surface_limit)
+    top_sandstone = top_basalt + t_sandstone
+    top_conglomerate = top_sandstone + t_conglomerate
+    
+    # Smooth all sedimentary interfaces
+    top_evaporite = _box_blur(top_evaporite, k=11)
+    top_dolomite = _box_blur(top_dolomite, k=11)
+    top_limestone = _box_blur(top_limestone, k=11)
+    top_shale = _box_blur(top_shale, k=11)
+    top_mudstone = _box_blur(top_mudstone, k=11)
+    top_siltstone = _box_blur(top_siltstone, k=11)
+    top_basalt = _box_blur(top_basalt, k=11)
+    top_sandstone = _box_blur(top_sandstone, k=11)
     top_conglomerate = _box_blur(top_conglomerate, k=11)
     
-    top_sandstone = np.minimum(top_sandstone_pre, top_conglomerate - 0.1)
-    top_sandstone = _box_blur(top_sandstone, k=11)
+    # ================================================================
+    # STEP 7: EROSION PEEL (expose deeper units on highs)
+    # ================================================================
+    # On mountains/highs, erosion has removed sediment, exposing deeper units.
+    # On basins, full sediment sequence preserved.
+    #
+    # Method: cap all sediment tops at (surface - regolith)
+    # This "peels" away layers where erosion is strong
     
-    top_siltstone = np.minimum(top_siltstone_pre, top_sandstone - 0.1)
-    top_mudstone = np.minimum(top_mudstone_pre, top_siltstone - 0.1)
-    top_shale = np.minimum(top_shale_pre, top_mudstone - 0.1)
-    top_limestone = np.minimum(top_limestone_pre, top_shale - 0.1)
-    top_dolomite = np.minimum(top_dolomite_pre, top_limestone - 0.1)
+    rock_surface_limit = E - (topsoil_thick + subsoil_thick + tC + tS + tR)
+    
+    # Peel each layer from top down
+    # Conglomerate (youngest) peels first
+    top_conglomerate = np.minimum(top_conglomerate, rock_surface_limit)
+    top_sandstone = np.minimum(top_sandstone, top_conglomerate - 0.1)
+    top_basalt = np.minimum(top_basalt, top_sandstone - 0.1)
+    top_siltstone = np.minimum(top_siltstone, top_basalt - 0.1)
+    top_mudstone = np.minimum(top_mudstone, top_siltstone - 0.1)
+    top_shale = np.minimum(top_shale, top_mudstone - 0.1)
+    top_limestone = np.minimum(top_limestone, top_shale - 0.1)
+    top_dolomite = np.minimum(top_dolomite, top_limestone - 0.1)
+    top_evaporite = np.minimum(top_evaporite, top_dolomite - 0.1)
+    
+    # Ensure basement top doesn't exceed evaporite base
+    top_granite = np.minimum(top_granite, top_evaporite - 0.1)
     top_evaporite = np.minimum(top_evaporite_pre, top_dolomite - 0.1)
     
     # Ensure crystalline tops don't exceed evaporite
