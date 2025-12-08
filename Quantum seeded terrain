@@ -1022,15 +1022,16 @@ def generate_stratigraphy(
   z_norm, rng,
   elev_range_m=700.0,
   pixel_scale_m=10.0,
-  soil_range_m=(0.3, 1.8),
-  # Colluvium controls (MASSIVE increase)
-  colluvium_max_m=80.0,
+  # MASSIVE regolith increase for visibility (user feedback: still too thin)
+  soil_range_m=(20.0, 80.0),  # Was (10.0, 50.0), now 2-8x thicker
+  # Colluvium controls
+  colluvium_max_m=120.0,  # Was 80.0, now 50% thicker
   wC_gentle=0.35, wC_curv=0.30, wC_low=0.20, wC_twi=0.15,
   C_relief_px=31, C_twi_k1=7, C_twi_k2=13, C_sigma=0.20, C_floor=0.5, C_bias=1.0,
-  # Saprolite controls (MASSIVE increase for visibility)
-  sap_median=40.0, sap_min=10.0, sap_max=100.0, sap_w_gentle=0.6, sap_w_inter=0.4, sap_relief_px=61, sap_sigma=0.35,
-  # Weathered rind controls (MASSIVE increase)
-  rind_median=10.0, rind_min=3.0, rind_max=30.0, rind_patch_beta=3.0, rind_patch_alpha=0.5,
+  # Saprolite controls (user feedback: still too thin, increase more)
+  sap_median=60.0, sap_min=15.0, sap_max=150.0, sap_w_gentle=0.6, sap_w_inter=0.4, sap_relief_px=61, sap_sigma=0.35,
+  # Weathered rind controls (increase more)
+  rind_median=15.0, rind_min=5.0, rind_max=50.0, rind_patch_beta=3.0, rind_patch_alpha=0.5,
   # Competent rock package (relative proportions)
   unit_thickness_m=(90.0,110.0,100.0),  # sandstone, shale, limestone
   undulation_amp_m=10.0, undulation_beta=3.2,
@@ -1097,10 +1098,10 @@ def generate_stratigraphy(
   valley_mid_n    = _normalize(valley_mid)
   valley_coarse_n = _normalize(valley_coarse)
 
-  # Valley fill should be VISIBLE in cross-sections (thick in modern valleys)
-  max_clay_m = 50.0   # Lake/wetland deposits
-  max_silt_m = 40.0   # Floodplain overbank
-  max_sand_m = 80.0   # Active channels
+  # Valley fill should be VERY VISIBLE (user feedback: still too thin)
+  max_clay_m = 80.0   # Lake/wetland deposits (was 50m)
+  max_silt_m = 60.0   # Floodplain overbank (was 40m)
+  max_sand_m = 100.0  # Active channels (was 80m)
 
   t_clay = max_clay_m * flat_low_n
   t_silt = max_silt_m * valley_mid_n
@@ -1199,27 +1200,70 @@ def generate_stratigraphy(
   sed_max = 600.0   # Maximum in structural basins (m)
   sed_total = sed_base + sed_max * basins  # ONLY basin control (not elevation!)
   
-  # CRITICAL FIX: Sandstone strongly suppressed by elevation AND slope
-  # Sandstone should:
-  # 1. Be ABSENT on current highs (eroded away or never deposited much)
-  # 2. Thin dramatically on slopes (high-energy = erosion, not deposition)
-  # 3. Be patchy (not continuous)
+  # ========== CRITICAL: FORMATION ABSENCE MASKS (TRUE PINCH-OUTS) ==========
+  # Key rule: Formations don't appear EVERYWHERE - they have spatial restrictions
+  # This breaks the "layer cake" uniformity
   
-  # Spatial patchiness
-  sand_patchiness = fractional_surface(N, beta=3.0, rng=rng)
+  # Sandstone absence mask: Patchy distribution, not everywhere
+  # Present: basin margins, fluvial belts, foothills, some basin interiors
+  # Absent: very steep mountains, highest peaks
+  sand_patchiness = fractional_surface(N, beta=2.5, rng=rng)
   sand_patchiness = _normalize(sand_patchiness)
-  sand_patch_mask = sand_patchiness > 0.5  # Only 50% of areas
   
-  # Strong suppression by CURRENT elevation and slope
-  # High areas and steep slopes get almost NO sandstone
-  sand_elevation_factor = np.clip(1.5 - z_norm, 0, 1)**2  # 0 at high elevations
-  sand_slope_factor = (1.0 - slope_norm)**3  # Very steep = almost 0
+  # Sandstone ABSENT only on:
+  # 1. Highest current peaks (very restrictive)
+  # 2. Steepest slopes
+  # 3. Random patchiness (creates lateral discontinuity)
+  sand_elevation_forbidden = z_norm > 0.85  # Only forbid on highest 15%
+  sand_slope_forbidden = slope_norm > 0.7   # Only forbid on steepest 30%
+  sand_patch_forbidden = sand_patchiness < 0.3  # Absent in 30% of areas
   
-  base_sand  = sed_total * f_sand * sand_env * sand_patch_mask.astype(float)
-  base_sand *= sand_elevation_factor * sand_slope_factor  # STRONG suppression
+  # Combined: sandstone present UNLESS forbidden
+  sandstone_present_mask = ~(sand_elevation_forbidden | sand_slope_forbidden | sand_patch_forbidden)
   
+  # Shale/mudstone absence mask: Thin or absent over highest peaks only
+  # Present: almost everywhere except very highest peaks
+  # Absent: only on extreme structural + topographic highs
+  shale_present_mask = ~((highs > 0.8) & (z_norm > 0.8))  # Absent only on extreme highs
+  
+  # Limestone/carbonate absence mask: More permissive, but still restricted
+  # Present: basins, stable shelves, moderate relief areas
+  # Absent: very steep slopes, highest peaks, some random areas
+  lime_patchiness = fractional_surface(N, beta=3.5, rng=rng)
+  lime_patchiness = _normalize(lime_patchiness)
+  lime_forbidden_terrain = (slope_norm > 0.6) | (z_norm > 0.85)  # Steep or very high
+  lime_forbidden_patch = lime_patchiness < 0.4  # Random absence in 40% of areas
+  limestone_present_mask = ~(lime_forbidden_terrain | lime_forbidden_patch)
+  
+  # Conglomerate: Near mountain fronts and basin margins (coarse clastic aprons)
+  # Present: transition zones between highs and basins
+  # More permissive than before
+  conglom_present_mask = (highs > 0.3) | (basins > 0.3)  # Present in most areas except extreme lows
+  
+  # Evaporite: ONLY in deepest, flattest basin centers (very restricted)
+  evap_present_mask = (basins > 0.85) & (slope_norm < 0.1)  # Very deep, very flat only
+  
+  # ========== COMPUTE BASE THICKNESSES WITH SUPPRESSION ==========
+  
+  # Sandstone: heavily suppressed + capped
+  sand_elevation_factor = np.clip(1.8 - z_norm, 0, 1)**3  # Very strong on highs
+  sand_slope_factor = (1.0 - slope_norm)**4  # Extremely steep = 0
+  
+  base_sand = sed_total * f_sand * sand_env
+  base_sand *= sand_elevation_factor * sand_slope_factor
+  base_sand *= sandstone_present_mask.astype(float)  # ZERO where mask is False
+  
+  # CRITICAL: Cap sandstone at 30% of local sediment capacity
+  sand_cap = 0.30 * sed_total
+  base_sand = np.minimum(base_sand, sand_cap)
+  
+  # Shale: dominates basins, thins over highs
   base_shale = sed_total * f_shale * shale_env
-  base_lime  = sed_total * f_lime  * lime_env
+  base_shale *= shale_present_mask.astype(float)  # Can be ZERO on highest peaks
+  
+  # Limestone: restricted to stable platforms
+  base_lime = sed_total * f_lime * lime_env
+  base_lime *= limestone_present_mask.astype(float)  # ZERO outside platforms
 
   # Quantum-smoothed variability
   rnd_sand  = smooth_random_field(k_thick)
@@ -1242,12 +1286,12 @@ def generate_stratigraphy(
   t_shale_rock = t_shale_trend * thin_factor
   t_lime_rock  = t_lime_trend  * thin_factor
   
-  # Add other sedimentary rock types (proportional to main facies)
-  t_conglomerate = (base_sand * 0.3) * thin_factor  # Coarse clastic margins
-  t_mudstone     = (base_shale * 0.35) * thin_factor
-  t_siltstone    = (base_shale * 0.25) * thin_factor
-  t_dolomite     = (base_lime * 0.20) * thin_factor
-  t_evaporite    = (basins**2 * 15.0) * (gentle**2)  # Only deepest, flattest basins
+  # Add other sedimentary rock types (proportional to main facies) + APPLY MASKS
+  t_conglomerate = (base_sand * 0.3) * thin_factor * conglom_present_mask.astype(float)
+  t_mudstone     = (base_shale * 0.35) * thin_factor * shale_present_mask.astype(float)
+  t_siltstone    = (base_shale * 0.25) * thin_factor * shale_present_mask.astype(float)
+  t_dolomite     = (base_lime * 0.20) * thin_factor * limestone_present_mask.astype(float)
+  t_evaporite    = (basins**2 * 15.0) * (gentle**2) * evap_present_mask.astype(float)
 
   # ---------- 4) Structural tops for sedimentary rocks ----------
   # With thickness controlled by basins (above), the basement will naturally end up:
@@ -1291,16 +1335,27 @@ def generate_stratigraphy(
   top_sand = top_silt - t_silt
   bottom_sand = top_sand - t_sand  # Explicit bottom of valley-fill sand
 
-  # ========== CRITICAL: EROSION PROPORTIONAL TO LOCAL SEDIMENT THICKNESS ==========
-  # Key insight: Fixed-depth erosion leaves thick caps on uplifted basins
-  # Solution: Remove a FRACTION of local thickness (not fixed depth)
-  # Result: Highs can lose >100% of sandstone, exposing shale/limestone/basement
+  # ========== CRITICAL: MUCH STRONGER EROSION ON MOUNTAINS ==========
+  # Key rule: Mountains = erosional highs that expose older rocks and basement
+  # Peaks should lose MOST or ALL sedimentary cover
+  # Basins preserve thick stacks
   
   E_rel = (E - E.mean()) / (E.std() + 1e-9)  # Relative elevation
   
-  # Erosion FRACTION (not depth): 0-1.2 (can remove more than 100% of top layer)
-  # High peaks with steep slopes: remove up to 120% of local sediment
-  erosion_fraction = np.clip(0.4 * E_rel + 0.5 * slope_norm, 0, 1.2)
+  # MUCH STRONGER erosion coefficients:
+  # - High peaks: up to 200% of local sediment (exposes basement)
+  # - Steep slopes: up to 150% (cuts through multiple formations)
+  # - Combined: peaks can lose ALL sediment + cut into basement
+  
+  # Compute relative position on structural highs (independent of current topography)
+  structural_high_factor = highs**2  # 0-1, high on structural peaks
+  
+  erosion_fraction = np.clip(
+      0.8 * E_rel +           # Strong dependence on current elevation
+      1.0 * slope_norm +      # Very strong dependence on slope
+      0.5 * structural_high_factor,  # Additional boost on structural highs
+      0, 2.0  # Allow up to 200% removal (exposes basement)
+  )
   erosion_fraction = _box_blur(erosion_fraction, k=7)
   
   # Compute total sediment thickness at each point (before erosion)
@@ -1945,11 +2000,14 @@ if __name__ == "__main__":
     strata = generate_stratigraphy(
         z_norm=z, rng=rng,
         elev_range_m=700.0, pixel_scale_m=10.0,
-        soil_range_m=(10.0, 50.0),  # MASSIVE increase
-        colluvium_max_m=80.0,  # MASSIVE increase wC_gentle=0.35, wC_curv=0.30, wC_low=0.20, wC_twi=0.15,
+        soil_range_m=(20.0, 80.0),  # User feedback: still too thin, increased
+        colluvium_max_m=120.0,  # Increased from 80m
+        wC_gentle=0.35, wC_curv=0.30, wC_low=0.20, wC_twi=0.15,
         C_relief_px=31, C_twi_k1=7, C_twi_k2=13, C_sigma=0.20, C_floor=0.5, C_bias=1.0,
-        sap_median=40.0, sap_min=10.0, sap_max=100.0,  # MASSIVE increase sap_w_gentle=0.6, sap_w_inter=0.4, sap_relief_px=61, sap_sigma=0.35,
-        rind_median=10.0, rind_min=3.0, rind_max=30.0,  # MASSIVE increase rind_patch_beta=3.0, rind_patch_alpha=0.5,
+        sap_median=60.0, sap_min=15.0, sap_max=150.0,  # Increased from 40/10/100
+        sap_w_gentle=0.6, sap_w_inter=0.4, sap_relief_px=61, sap_sigma=0.35,
+        rind_median=15.0, rind_min=5.0, rind_max=50.0,  # Increased from 10/3/30
+        rind_patch_beta=3.0, rind_patch_alpha=0.5,
         unit_thickness_m=(90.0,110.0,100.0),
         undulation_amp_m=10.0, undulation_beta=3.2,
         dip_deg=6.0, dip_dir_deg=45.0,
