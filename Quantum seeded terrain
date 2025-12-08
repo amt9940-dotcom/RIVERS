@@ -816,12 +816,32 @@ def generate_stratigraphy(
   interface_blur_sigma=None
 ):
   """
-  Build stratigraphy where:
-  - Topsoil / Colluvium / Saprolite / WeatheredBR follow hillslope & weathering rules.
-  - Sandstone / Shale / Limestone form broad, gently dipping sheets that thicken
-    in basins and thin on highs (marine transgression style).
-  - Basement provides a smooth crystalline foundation underneath.
-  - All randomness uses Qiskit-seeded rng, but is heavily smoothed to avoid 'spiky columns'.
+  Build geologically-realistic stratigraphy using elevation and slope from topography.
+  
+  GEOLOGICAL PRINCIPLES (References: USGS, Principles of Sedimentology and Stratigraphy - Boggs):
+  
+  Layer Generation Based on Elevation and Slope:
+  - SAND: Forms in low-slope, low-elevation environments (deserts, beaches, riverbanks, dunes).
+          Does NOT form on steep mountain slopes or high altitudes.
+  - CLAY: Forms in low-energy, flat areas (floodplains, lakes, ocean basins).
+          Can appear above or below sand, but not usually above gravel.
+  - GRAVEL: Forms in high-energy, sloped environments (river channels, alluvial fans).
+            Must appear above bedrock, below fine-grained layers.
+  - SILT: Forms in slow water bodies (lakes, estuaries). Can lie above clay or sand.
+  - TOPSOIL: Appears at surface only. Forms only in moderate slope and stable terrain.
+             Does NOT appear on steep cliffs or raw rock faces.
+  - BEDROCK: Appears at base of all layers. Only exposed at surface in very high-slope regions.
+  
+  Stratigraphic Stacking Rules:
+  - Typical sequence: Topsoil → Sand/Silt → Clay → Gravel → Bedrock
+  - Sand can appear above clay in fluvial or coastal settings
+  - Gravel always lies above bedrock, below fine-grained layers
+  - Clay layers should not be placed above topsoil or gravel in normal undisturbed terrain
+  
+  The topography generator (quantum_seeded_topography) provides elevation and slope data,
+  which this function uses to determine layer types, thicknesses, and stacking order.
+  
+  All randomness uses Qiskit-seeded rng, but is heavily smoothed to avoid 'spiky columns'.
   """
   N = z_norm.shape[0]
   # Absolute elevation (m)
@@ -880,63 +900,122 @@ def generate_stratigraphy(
   bed_struct_zm = bed_struct - np.mean(bed_struct)
 
 
-  # ---------- 3) Continental crust & sedimentary thickness trend ----------
+  # ========== GEOLOGICALLY-INFORMED LAYER GENERATION ==========
+  # Based on elevation and slope from topography generator
+  # References: USGS, Principles of Sedimentology and Stratigraphy (Boggs)
+  
   elev_span = float(E.max() - E.min() + 1e-9)
   crust_thick = crust_thickness_field(E, elev_span)  # thicker crust under high topo
 
-  # Assume ~35% of crust_thick is sedimentary cover on continental crust. :contentReference[oaicite:10]{index=10}
-  sed_frac  = 0.35
-  sed_total = sed_frac * crust_thick
-
+  # Extract elevation and slope from topography - PRIMARY drivers for layer generation
+  # These come from the topography generator and must be used to determine layers
+  dEx, dEy = np.gradient(E, pixel_scale_m, pixel_scale_m)
+  slope_mag = np.sqrt(dEx**2 + dEy**2) + 1e-12
+  slope_n   = _normalize(slope_mag)  # 0 = gentle, 1 = steep
+  gentle    = 1.0 - slope_n           # 0 = steep, 1 = gentle
+  
+  # Normalize elevation (0 = low, 1 = high)
+  E_norm = _normalize(E)
+  low_elev = 1.0 - E_norm  # 1 = low elevation, 0 = high elevation
+  
   # Very coarse topographic smooth to define basins vs highs
   k_coarse = max(31, int(0.15 * N) | 1)
   z_smooth = _box_blur(z_norm, k=k_coarse)
   basins   = _normalize(1.0 - z_smooth)   # 1 in lows, 0 on highs
   highs    = _normalize(z_smooth)         # 1 on highs
-
-  # Present slope – steeper = more erosion, so thinner preserved cover.
-  dEx, dEy = np.gradient(E)
-  slope_mag = np.sqrt(dEx**2 + dEy**2)
-  slope_n   = _normalize(slope_mag)
-  gentle    = 1.0 - slope_n
-
-  # Facies environments (all 0–1 after _normalize):
-  # - Sandstone: shorelines / basin margins → intermediate basinness, some slope. :contentReference[oaicite:11]{index=11}
-  sand_env_raw  = basins * (1.0 - basins) * (0.5 + 0.5 * slope_n)
-  shale_env_raw = basins                        # deepening into basins (offshore muds).
-  lime_env_raw  = highs * gentle                # carbonate platforms on gentle highs. :contentReference[oaicite:12]{index=12}
-
-  sand_env  = _normalize(sand_env_raw)
+  
+  # Helper: smoothed random field (quantum-seeded, but laterally coherent)
+  def smooth_random_field(k):
+      noise = rng.standard_normal(size=E.shape)
+      return _box_blur(noise, k=max(5, int(k) | 1))
+  
+  k_thick = max(15, int(0.06 * N) | 1)
+  
+  # ========== LAYER GENERATION BASED ON GEOLOGICAL PRINCIPLES ==========
+  # Using elevation and slope to determine layer types and thicknesses
+  
+  # --- 1) SAND LAYER ---
+  # Forms in low-slope, low-elevation environments:
+  # - Deserts, beaches, riverbanks, dunes (moderate slope only)
+  # - Should NOT form on steep mountain slopes or high altitudes
+  # Reference: USGS - Sand deposition occurs in low-energy, flat to gently sloping areas
+  sand_elev_factor = np.clip(1.0 - E_norm, 0.0, 1.0)  # Prefer low elevation
+  sand_slope_factor = np.clip(1.0 - slope_n * 1.5, 0.0, 1.0)  # Prefer gentle slopes, penalize steep
+  # Allow moderate slopes for dunes (0.2-0.4 normalized slope)
+  dune_slope = np.clip((slope_n - 0.2) / 0.2, 0.0, 1.0) * np.clip((0.4 - slope_n) / 0.2, 0.0, 1.0)
+  sand_env_raw = sand_elev_factor * (sand_slope_factor * 0.7 + dune_slope * 0.3)
+  # Also favor basin margins and floodplains
+  sand_env_raw += 0.3 * basins * (1.0 - basins) * gentle
+  sand_env = _normalize(sand_env_raw)
+  
+  # --- 2) CLAY LAYER ---
+  # Forms in low-energy, flat areas:
+  # - Floodplains, lakes, ocean basins
+  # - Can appear above or below sand, but not usually above gravel
+  # Reference: Boggs - Clay settles in quiet water, low-energy environments
+  clay_elev_factor = low_elev  # Prefer low elevation
+  clay_slope_factor = gentle * gentle  # Strongly prefer very gentle slopes
+  clay_env_raw = clay_elev_factor * clay_slope_factor
+  # Favor deep basins (lakes, ocean basins)
+  clay_env_raw += 0.5 * basins * basins * gentle
+  clay_env = _normalize(clay_env_raw)
+  
+  # --- 3) GRAVEL LAYER ---
+  # Forms in high-energy, sloped environments:
+  # - River channels, alluvial fans, mountain base runoff zones
+  # - Must appear near surface or just below loose sediment
+  # - Typically found above bedrock and below sand or soil
+  # Reference: USGS - Gravel requires high energy to transport, forms on slopes
+  gravel_elev_factor = E_norm * 0.5 + 0.5  # Can form at various elevations
+  gravel_slope_factor = np.clip(slope_n * 1.2, 0.0, 1.0)  # Prefer moderate to steep slopes
+  gravel_env_raw = gravel_elev_factor * gravel_slope_factor
+  # Favor areas near mountain bases (moderate elevation, moderate slope)
+  mid_elev = np.clip(1.0 - np.abs(E_norm - 0.5) * 2.0, 0.0, 1.0)
+  gravel_env_raw += 0.4 * mid_elev * np.clip(slope_n - 0.3, 0.0, 1.0) / 0.7
+  gravel_env = _normalize(gravel_env_raw)
+  
+  # --- 4) SILT LAYER ---
+  # Forms in slow water bodies (lakes, estuaries)
+  # - Can lie above clay or sand depending on deposition history
+  # Reference: Boggs - Silt is intermediate grain size, forms in quiet water
+  silt_elev_factor = low_elev  # Prefer low elevation
+  silt_slope_factor = gentle  # Prefer gentle slopes
+  silt_env_raw = silt_elev_factor * silt_slope_factor
+  # Favor areas between sand and clay environments
+  silt_env_raw += 0.3 * (sand_env + clay_env) * 0.5
+  silt_env = _normalize(silt_env_raw)
+  
+  # Calculate thicknesses for unconsolidated sediments (valley-fill)
+  # These form near the surface in appropriate environments
+  max_clay_m = 25.0   # Clay in deepest, flattest basins
+  max_silt_m = 20.0   # Silt in quiet water areas
+  max_sand_m = 30.0   # Sand in low-energy, low-slope areas
+  max_gravel_m = 15.0  # Gravel in high-energy, sloped areas
+  
+  t_clay = max_clay_m * clay_env
+  t_silt = max_silt_m * silt_env
+  t_sand = max_sand_m * sand_env
+  t_gravel = max_gravel_m * gravel_env
+  
+  # Assume ~35% of crust_thick is sedimentary cover on continental crust
+  sed_frac  = 0.35
+  sed_total = sed_frac * crust_thick
+  
+  # Facies environments for consolidated sedimentary rocks (deeper package)
+  # - Sandstone: shorelines / basin margins → intermediate basinness, some slope
+  sand_env_raw_rock  = basins * (1.0 - basins) * (0.5 + 0.5 * slope_n)
+  shale_env_raw = basins                        # deepening into basins (offshore muds)
+  lime_env_raw  = highs * gentle                # carbonate platforms on gentle highs
+  
+  sand_env_rock  = _normalize(sand_env_raw_rock)
   shale_env = _normalize(shale_env_raw)
   lime_env  = _normalize(lime_env_raw)
 
-# --- NEW: shallow valley-fill sediments (Clay → Silt → Sand) ---
-  # Only treat **low-elevation basins** as valleys, not high mountain flanks.
-  # z_norm: 0 = overall low, 1 = overall high
-  low_elev_factor = np.clip(1.0 - z_norm, 0.0, 1.0)  # kills valley-fill on high ground
-  basin_low = basins * low_elev_factor               # "true" low basins
-
-  # - Clay: flattest parts of deepest basins
-  # - Silt: slightly broader low areas
-  # - Sand: somewhat higher-energy parts of those basins
-  flat_low      = (1.0 - slope_n) * basin_low
-  valley_mid    = (1.0 - slope_n * 0.7) * basin_low
-  valley_coarse = basin_low * slope_n
-
-  flat_low_n      = _normalize(flat_low)
-  valley_mid_n    = _normalize(valley_mid)
-  valley_coarse_n = _normalize(valley_coarse)
-
-  max_clay_m = 20.0   # up to ~20 m in deepest, flattest basins
-  max_silt_m = 15.0
-  max_sand_m = 25.0   # you can lower this if sand is still too thick
-
-  t_clay = max_clay_m * flat_low_n
-  t_silt = max_silt_m * valley_mid_n
-  t_sand = max_sand_m * valley_coarse_n
 
 
-
+  # ========== DEEPER CONSOLIDATED SEDIMENTARY ROCKS ==========
+  # These form the deeper sedimentary package below unconsolidated valley-fill
+  
   # Relative vertical proportions from unit_thickness_m
   T_sand, T_shale, T_lime = unit_thickness_m
   total_units = float(T_sand + T_shale + T_lime + 1e-12)
@@ -944,17 +1023,10 @@ def generate_stratigraphy(
   f_shale = T_shale / total_units
   f_lime  = T_lime  / total_units
 
-  # Helper: smoothed random field (quantum-seeded, but laterally coherent)
-  def smooth_random_field(k):
-      noise = rng.standard_normal(size=E.shape)
-      return _box_blur(noise, k=max(5, int(k) | 1))
-
-  k_thick = max(15, int(0.06 * N) | 1)
-
-  # Base thickness fields (trend) for each unit
-  base_sand  = sed_total * f_sand  * (0.4 + 0.6 * sand_env)
-  base_shale = sed_total * f_shale * (0.3 + 0.7 * shale_env)
-  base_lime  = sed_total * f_lime  * (0.3 + 0.7 * lime_env)
+  # Base thickness fields (trend) for each consolidated rock unit
+  base_sandstone  = sed_total * f_sand  * (0.4 + 0.6 * sand_env_rock)
+  base_shale_rock = sed_total * f_shale * (0.3 + 0.7 * shale_env)
+  base_lime_rock  = sed_total * f_lime  * (0.3 + 0.7 * lime_env)
 
   # Quantum-smoothed variability (keeps sheets coherent, avoids "icicles")
   rnd_sand  = smooth_random_field(k_thick)
@@ -967,53 +1039,110 @@ def generate_stratigraphy(
       f = np.clip(f, 0.5, 1.5)
       return np.clip(base * f, 0.0, None)
 
-  t_sand_trend  = apply_variation(base_sand,  rnd_sand)
-  t_shale_trend = apply_variation(base_shale, rnd_shale)
-  t_lime_trend  = apply_variation(base_lime,  rnd_lime)
+  t_sandstone_trend  = apply_variation(base_sandstone,  rnd_sand)
+  t_shale_trend = apply_variation(base_shale_rock, rnd_shale)
+  t_lime_trend  = apply_variation(base_lime_rock,  rnd_lime)
 
-  # Thin units modestly on steep slopes, but never turn them off entirely
-  thin_factor = 0.4 + 0.6 * gentle  # 1 on gentle, 0.4 on steep
-  t_sand  = t_sand_trend  * thin_factor
-  t_shale = t_shale_trend * thin_factor
-  t_lime  = t_lime_trend  * thin_factor
+  # Thin units on steep slopes (erosion), but maintain minimum thickness
+  # Steep slopes erode more, preserving less sediment
+  thin_factor = 0.3 + 0.7 * gentle  # 1.0 on gentle, 0.3 on steep
+  t_sandstone  = t_sandstone_trend  * thin_factor
+  t_shale_rock = t_shale_trend * thin_factor
+  t_lime_rock  = t_lime_trend  * thin_factor
 
-  # ---------- 4) Structural tops for Sandstone / Shale / Limestone ----------
+  # ========== STRATIGRAPHIC INTERFACE CALCULATION ==========
+  # Enforce proper stacking: Topsoil → Sand/Silt → Clay → Gravel → Bedrock
+  # Reference: Principles of Sedimentology and Stratigraphy (Boggs)
+  
   Emean       = float(E.mean())
   crust_mean  = float(crust_thick.mean())
   crust_anom  = (crust_thick - crust_mean) / (crust_mean + 1e-9)
 
-  # Deeper sediment stack under thicker crust (mountain belts), shallower under thinner crust.
+  # Base reference depth for sedimentary layers
+  # Deeper sediment stack under thicker crust (mountain belts), shallower under thinner crust
   top_sed_ref = (
       (Emean - burial_depth_m)
       - 0.3 * crust_anom * elev_span
       + bed_struct_weight * bed_struct_zm
   )
 
-  top_sandstone_raw = top_sed_ref
-  top_shale_raw     = top_sandstone_raw - t_sand
-  top_limestone_raw = top_shale_raw     - t_shale
-  top_basement_raw  = top_limestone_raw - t_lime  # top of crystalline basement
-
-    # ---------- 5) Regolith stack above rock ----------
+  # ---------- 5) REGOLITH STACK ABOVE SEDIMENTARY LAYERS ----------
+  # Topsoil appears at surface only, forms only in moderate slope and stable terrain
+  # Should not appear on steep cliffs or raw rock faces
   eps = 0.01
 
-  # A and B horizons
+  # A and B horizons (Topsoil and Subsoil)
+  # Topsoil thickness already accounts for slope (via soil_thickness_from_slope)
+  # Further reduce topsoil on very steep slopes (cliffs, rock faces)
+  steep_cliff_mask = slope_n > 0.7  # Very steep slopes (>70% normalized)
+  topsoil_thick_adjusted = np.where(steep_cliff_mask, topsoil_thick * 0.1, topsoil_thick)
+  
   top_topsoil   = E
-  top_subsoil   = top_topsoil   - topsoil_thick
+  top_subsoil   = top_topsoil   - topsoil_thick_adjusted
   top_colluvium = top_subsoil   - subsoil_thick
 
-    # Colluvium, saprolite, weathered rind
+  # Colluvium, saprolite, weathered rind
   top_saprolite = top_colluvium - tC
   top_rind      = top_saprolite - tS
 
-  # NEW: valley-fill sediments (Clay → Silt → Sand) between weathered rind and bedrock
-  # These will be thick in basins / low-relief areas and thin or vanish on ridges.
+  # ========== STRATIGRAPHIC STACKING WITH GEOLOGICAL RULES ==========
+  # Order from top to bottom: Topsoil → Sand/Silt → Clay → Gravel → Bedrock
+  # But allow variations based on depositional environment:
+  # - Sand can appear above clay in fluvial/coastal settings
+  # - Gravel always lies above bedrock, below fine-grained layers
+  
+  # Determine stacking order based on environmental factors
+  # In areas with high sand_env and low clay_env: Sand → Clay → Gravel
+  # In areas with high clay_env: Clay → Sand → Gravel (clay deposited first)
+  # Gravel always near bottom (above bedrock)
+  
+  # Calculate which layer should be on top based on depositional environment
+  sand_dominates = sand_env > clay_env
+  clay_dominates = clay_env > sand_env * 1.2
+  
+  # Valley-fill unconsolidated sediments stack below weathered rind
+  # Clay forms in deepest basins, so it's typically lowest
+  # Sand can be above or below clay depending on environment
+  # Silt is intermediate
+  # Gravel forms above bedrock, below fine-grained layers
+  
+  # Base: start from weathered rind and stack downward
+  # Clay typically forms first (deepest, quietest water)
   top_clay = top_rind - t_clay
-  top_silt = top_clay - t_silt
-  top_sand = top_silt - t_sand
-
-  # Ensure rock units stay below valley fill and respect ordering
-  top_sandstone = np.minimum(top_sandstone_raw, top_sand - eps)
+  
+  # Silt can be above or below clay depending on environment
+  # In fluvial settings, silt may be above clay; in deep basins, clay is deeper
+  top_silt = np.where(
+      sand_dominates,
+      top_clay - t_silt,  # Silt above clay in high-energy settings
+      top_rind - t_silt   # Silt near top in low-energy settings
+  )
+  top_silt = np.minimum(top_silt, top_clay)  # Ensure proper ordering
+  
+  # Sand can appear above clay in fluvial/coastal settings
+  top_sand = np.where(
+      sand_dominates,
+      top_rind - t_sand,  # Sand on top in high-energy settings
+      top_silt - t_sand   # Sand below silt/clay in low-energy settings
+  )
+  top_sand = np.minimum(top_sand, np.minimum(top_silt, top_clay))
+  
+  # Gravel always above bedrock, below fine-grained layers
+  # It forms in high-energy environments, so it's typically near the bottom of unconsolidated sediments
+  top_gravel = np.minimum(top_sand, top_clay) - t_gravel
+  
+  # Ensure proper ordering: Gravel must be above bedrock
+  top_gravel = np.maximum(top_gravel, top_sed_ref - 50.0)  # At least 50m above deep sediments
+  
+  # ---------- 4) DEEPER CONSOLIDATED SEDIMENTARY ROCKS ----------
+  # These form below the unconsolidated valley-fill sediments
+  top_sandstone_raw = top_sed_ref
+  top_shale_raw     = top_sandstone_raw - t_sandstone
+  top_limestone_raw = top_shale_raw     - t_shale_rock
+  top_basement_raw  = top_limestone_raw - t_lime_rock  # top of crystalline basement
+  
+  # Ensure consolidated rocks stay below unconsolidated sediments and respect ordering
+  top_sandstone = np.minimum(top_sandstone_raw, top_gravel - eps)
   top_shale     = np.minimum(top_shale_raw,     top_sandstone - eps)
   top_limestone = np.minimum(top_limestone_raw, top_shale - eps)
   top_basement  = np.minimum(top_basement_raw,  top_limestone - eps)
@@ -1069,19 +1198,47 @@ def generate_stratigraphy(
       z_floor = float(top_basement.min() - 0.2 * elev_span)
       top_basement_floor = np.full_like(top_basement, z_floor)
 
-    # ---------- 8) Thickness rasters ----------
+  # ---------- 8) THICKNESS RASTERS WITH STRATIGRAPHIC ORDERING ----------
+  # Calculate final thicknesses ensuring proper geological stacking
+  # Order: Topsoil → Subsoil → Colluvium → Saprolite → WeatheredBR → 
+  #        Sand/Silt → Clay → Gravel → Sandstone → Shale → Limestone → Basement
+  
+  # Handle variable stacking: Sand can be above or below Clay depending on environment
+  # Determine which is actually on top at each location
+  sand_above_clay = top_sand > top_clay
+  
   thickness = {
       # Regolith
       "Topsoil":       np.maximum(top_topsoil     - top_subsoil,         0.0),
       "Subsoil":       np.maximum(top_subsoil     - top_colluvium,       0.0),
       "Colluvium":     np.maximum(top_colluvium   - top_saprolite,       0.0),
       "Saprolite":     np.maximum(top_saprolite   - top_rind,            0.0),
-      "WeatheredBR":   np.maximum(top_rind        - top_clay,            0.0),
+      "WeatheredBR":   np.maximum(top_rind        - np.maximum(top_sand, top_clay), 0.0),
 
-      # NEW valley-fill sediments
-      "Clay":          np.maximum(top_clay        - top_silt,            0.0),
-      "Silt":          np.maximum(top_silt        - top_sand,            0.0),
-      "Sand":          np.maximum(top_sand        - top_sandstone,       0.0),
+      # Valley-fill unconsolidated sediments (order depends on environment)
+      # Sand: thickness depends on whether it's above or below clay/silt
+      "Sand":          np.where(
+          sand_above_clay,
+          np.maximum(top_sand - np.maximum(top_silt, top_clay), 0.0),  # Sand above
+          np.maximum(top_sand - top_gravel, 0.0)  # Sand below
+      ),
+      
+      # Silt: intermediate layer
+      "Silt":          np.where(
+          sand_above_clay,
+          np.maximum(top_silt - top_clay, 0.0),  # Silt below sand
+          np.maximum(top_silt - top_sand, 0.0)  # Silt above sand
+      ),
+      
+      # Clay: typically deepest of fine-grained sediments
+      "Clay":          np.where(
+          sand_above_clay,
+          np.maximum(top_clay - top_gravel, 0.0),  # Clay below sand/silt
+          np.maximum(top_clay - top_gravel, 0.0)  # Clay below sand
+      ),
+      
+      # Gravel: always above bedrock, below fine-grained layers
+      "Gravel":        np.maximum(top_gravel - top_sandstone, 0.0),
 
       # Sedimentary Units (existing deeper package)
       "Sandstone":     np.maximum(top_sandstone     - top_conglomerate,    0.0),
@@ -1113,10 +1270,11 @@ def generate_stratigraphy(
       "Saprolite":     top_saprolite,
       "WeatheredBR":   top_rind,
 
-      # NEW valley-fill sediments
-      "Clay":          top_clay,
-      "Silt":          top_silt,
+      # Valley-fill unconsolidated sediments
       "Sand":          top_sand,
+      "Silt":          top_silt,
+      "Clay":          top_clay,
+      "Gravel":        top_gravel,
 
       # Sedimentary Units
       "Sandstone":     top_sandstone,
@@ -1213,6 +1371,13 @@ def generate_stratigraphy(
           "density":     1700,
           "porosity":    0.35,
           "K_rel":       0.85,
+      },
+      "Gravel": {
+          # coarse-grained, high-energy deposits; forms in river channels, alluvial fans
+          "erodibility": 0.70,
+          "density":     2000,
+          "porosity":    0.30,
+          "K_rel":       0.70,
       },
       "Till": {
           # glacial rubble; can be quite erodible or resistant depending on compaction
@@ -1355,6 +1520,12 @@ def generate_stratigraphy(
       "basins":       basins,    # 0 (high areas) → 1 (deep basins)
       "highs":        highs,     # 0 (basins)    → 1 (high areas)
       "paleo_slope":  slope_n,   # 0 (gentle)   → 1 (steep)
+      "elevation":    E_norm,    # 0 (low elev) → 1 (high elev) - from topography
+      "slope_mag":    slope_n,   # 0 (gentle)   → 1 (steep) - from topography
+      "sand_env":     sand_env,   # Sand depositional environment (0-1)
+      "clay_env":     clay_env,   # Clay depositional environment (0-1)
+      "gravel_env":   gravel_env, # Gravel depositional environment (0-1)
+      "silt_env":     silt_env,   # Silt depositional environment (0-1)
   }
 
 
@@ -1408,10 +1579,11 @@ def compute_top_material_map(strata, min_thick=0.05):
         "Saprolite",
         "WeatheredBR",
 
-        # NEW valley-fill sediments
-        "Clay",
-        "Silt",
+        # Valley-fill unconsolidated sediments
         "Sand",
+        "Silt",
+        "Clay",
+        "Gravel",
 
         # Sedimentary package
         "Sandstone",
@@ -1629,9 +1801,10 @@ def plot_cross_section(strata, row=None, col=None, min_draw_thickness=0.05, ax=N
         "WeatheredBR",
 
         # valley-fill sediments
-        "Clay",
-        "Silt",
         "Sand",
+        "Silt",
+        "Clay",
+        "Gravel",
 
         # sedimentary package
         "Sandstone",
@@ -1662,9 +1835,10 @@ def plot_cross_section(strata, row=None, col=None, min_draw_thickness=0.05, ax=N
         "Saprolite":    "burlywood",
         "WeatheredBR":  "khaki",
 
-        "Clay":         "lightcoral",
-        "Silt":         "thistle",
         "Sand":         "navajowhite",
+        "Silt":         "thistle",
+        "Clay":         "lightcoral",
+        "Gravel":       "tan",
 
         "Sandstone":    "orange",
         "Conglomerate": "chocolate",
