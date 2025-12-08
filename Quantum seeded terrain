@@ -178,6 +178,148 @@ def _normalize(x, eps=1e-12):
   lo, hi = np.percentile(x, [2,98])
   return np.clip((x - lo)/(hi - lo + eps), 0.0, 1.0)
 
+# ================================================================================
+# TERRAIN ANALYSIS FOR LAYER GENERATION
+# ================================================================================
+# These functions compute terrain parameters that drive geological layer placement:
+#   - Curvature (concave vs convex)
+#   - Local prominence (topographic highs relative to neighbors)
+#   - Drainage accumulation (channels vs divides)
+#   - Terrain classification (basin, ridge, slope, flat)
+# ================================================================================
+
+def compute_terrain_parameters(E, E_norm, pixel_scale_m, rng=None):
+    """
+    Compute comprehensive terrain parameters for geological layer generation.
+    
+    Returns dict with:
+        slope_n: Normalized slope (0=flat, 1=steep)
+        curvature: Profile curvature (negative=convex/ridge, positive=concave/valley)
+        curvature_plan: Plan curvature (convergent vs divergent flow)
+        prominence: Local topographic prominence (0=valley, 1=peak)
+        drainage_accum: Proxy for flow accumulation (high=channel)
+        terrain_class: Classification (basin, ridge, slope, channel, flat)
+    
+    References:
+        - Zevenbergen & Thorne (1987) "Quantitative analysis of land surface topography"
+        - Wilson & Gallant (2000) "Terrain Analysis: Principles and Applications"
+    """
+    N = E.shape[0]
+    
+    # ============ SLOPE ============
+    dzdx, dzdy = np.gradient(E, pixel_scale_m, pixel_scale_m)
+    slope_mag = np.hypot(dzdx, dzdy)
+    slope_n = _normalize(slope_mag)
+    
+    # ============ CURVATURE ============
+    # Profile curvature: curvature in the direction of maximum slope
+    # Plan curvature: curvature perpendicular to slope direction
+    # Ref: Evans (1972), Zevenbergen & Thorne (1987)
+    
+    # Second derivatives
+    d2zdx2, _ = np.gradient(dzdx, pixel_scale_m, pixel_scale_m)
+    _, d2zdy2 = np.gradient(dzdy, pixel_scale_m, pixel_scale_m)
+    d2zdxdy, _ = np.gradient(dzdy, pixel_scale_m, pixel_scale_m)
+    
+    # Laplacian (mean curvature proxy)
+    # Positive = concave (valleys, depressions) = DEPOSITION zones
+    # Negative = convex (ridges, peaks) = EROSION zones
+    laplacian = d2zdx2 + d2zdy2
+    curvature = laplacian  # Use laplacian as primary curvature measure
+    
+    # Normalize curvature to useful range
+    curv_std = np.std(curvature) + 1e-9
+    curvature_norm = np.clip(curvature / (3 * curv_std), -1, 1)
+    
+    # ============ LOCAL PROMINENCE ============
+    # How high is this point relative to its neighbors?
+    # High prominence = mountain peaks, tectonic highs
+    # Low prominence = valleys, basins
+    # Ref: Similar to topographic prominence in geomorphology
+    
+    # Multi-scale prominence: compare to neighbors at different radii
+    prominence = np.zeros_like(E)
+    for radius in [5, 15, 31, 61]:
+        k = max(3, radius | 1)  # Ensure odd
+        E_smooth = _box_blur(E, k=k)
+        local_diff = E - E_smooth  # How much higher than local average?
+        prominence += _normalize(local_diff)
+    prominence = _normalize(prominence)
+    
+    # ============ DRAINAGE ACCUMULATION PROXY ============
+    # Ref: Flow accumulation determines channel vs interfluve
+    # We approximate this using a combination of:
+    #   - Inverted elevation (lower = more flow)
+    #   - Concavity (concave = flow convergence)
+    #   - Inverted slope (gentle = flow accumulation)
+    
+    # Simple D8-like flow accumulation proxy
+    # Real flow accumulation requires iterative algorithms, so we approximate
+    concave_zones = np.maximum(curvature_norm, 0)  # Only concave areas
+    low_areas = 1.0 - E_norm
+    gentle_areas = 1.0 - slope_n
+    
+    # Combine factors for drainage accumulation proxy
+    drainage_raw = (
+        0.4 * low_areas +           # Water flows to low areas
+        0.3 * concave_zones +       # Water converges in concave areas
+        0.3 * gentle_areas          # Water accumulates on gentle slopes
+    )
+    
+    # Smooth to get connected channel networks
+    drainage_accum = _box_blur(drainage_raw, k=7)
+    drainage_accum = _normalize(drainage_accum)
+    
+    # ============ TERRAIN CLASSIFICATION ============
+    # Classify each cell into terrain type for layer generation
+    
+    # Basin: low, flat, concave
+    is_basin = (E_norm < 0.4) & (slope_n < 0.25) & (curvature_norm > 0)
+    
+    # Ridge: high, convex
+    is_ridge = (E_norm > 0.6) & (curvature_norm < -0.2) & (prominence > 0.5)
+    
+    # Channel: concave, moderate-low elevation, high drainage
+    is_channel = (curvature_norm > 0.2) & (drainage_accum > 0.6) & (E_norm < 0.6)
+    
+    # Steep slope: high slope regardless of elevation
+    is_steep = slope_n > 0.5
+    
+    # Flat: low slope, not in channel
+    is_flat = (slope_n < 0.15) & ~is_channel
+    
+    # Mountain flank: high elevation, moderate slope
+    is_mountain_flank = (E_norm > 0.5) & (slope_n > 0.2) & (slope_n < 0.6)
+    
+    # Alluvial fan zone: where mountains meet basins (transition zone)
+    is_alluvial_fan = (
+        (E_norm > 0.3) & (E_norm < 0.6) &  # Mid-elevation
+        (slope_n > 0.15) & (slope_n < 0.4) &  # Moderate slope
+        (prominence < 0.4)  # Not on peaks
+    )
+    
+    # Interior basin: flat, low, enclosed (for evaporites)
+    # Must be very flat and very low
+    is_interior_basin = (E_norm < 0.25) & (slope_n < 0.1) & (curvature_norm > 0.1)
+    
+    return {
+        "slope_n": slope_n,
+        "curvature": curvature_norm,  # -1 to 1: negative=convex, positive=concave
+        "prominence": prominence,      # 0 to 1: 0=valley, 1=peak
+        "drainage_accum": drainage_accum,  # 0 to 1: high=channel
+        "is_basin": is_basin,
+        "is_ridge": is_ridge,
+        "is_channel": is_channel,
+        "is_steep": is_steep,
+        "is_flat": is_flat,
+        "is_mountain_flank": is_mountain_flank,
+        "is_alluvial_fan": is_alluvial_fan,
+        "is_interior_basin": is_interior_basin,
+        "dzdx": dzdx,
+        "dzdy": dzdy,
+    }
+
+
 # --------------- Wind-relevant geological features -------------------
 def compute_topo_fields(surface_elev, pixel_scale_m):
     """
@@ -699,59 +841,68 @@ def gravel_thickness_field(
     max_gravel_m=8.0,
     floor_m=0.0,
     lognorm_sigma=0.30,
+    drainage=None,
+    curvature=None,
 ):
     """
     Compute GRAVEL layer thickness based on terrain characteristics.
     
     Geological basis (Ref: Boggs, 2012; Nichols, 2009):
-    - Gravel forms in HIGH-ENERGY environments where only coarse clasts settle
-    - River channels (especially braided rivers in mountain fronts)
-    - Alluvial fans (at mountain-valley transitions)
-    - Mountain base runoff zones
-    - Beach/coastal gravel in high-wave-energy settings
+    - Gravel forms in HIGH-ENERGY environments:
+      * River channels (HIGH drainage accumulation)
+      * Alluvial fans (mountain-valley transitions)
+      * Base of steep slopes
     
-    Key controls:
-    - SLOPE: Moderate to steep slopes required (high transport energy)
-      Ref: Hjulström curve - gravel requires ~1 m/s flow velocity
-    - ELEVATION: Proximal to source (mountain flanks, not valley floors)
-    - POSITION: Best at slope breaks (alluvial fan apex zones)
+    Key terrain controls:
+    - DRAINAGE: HIGH drainage = active channels = GRAVEL
+    - SLOPE: Moderate slopes (energy for transport, not too steep)
+    - CURVATURE: Concave channels accumulate gravel
     
     Stratigraphic position:
-    - Above bedrock (first coarse deposit)
-    - Below finer sediments (sand, silt, clay)
-    - Often at unconformity surfaces
+    - Above bedrock (lag deposit)
+    - In channels below sand
     """
-    # Gravel favors moderate-to-steep slopes (alluvial fans, river channels)
-    # But NOT the steepest slopes (those are bare bedrock)
-    # Ref: Blair & McPherson (1994) "Alluvial fans and their natural distinction"
+    # Gravel favors HIGH DRAINAGE (active channels)
+    # Ref: Hjulström curve - gravel requires high velocity
+    if drainage is not None:
+        channel_factor = drainage ** 1.2  # Strong correlation with channels
+    else:
+        channel_factor = np.zeros_like(z_norm)
     
-    # Optimal slope range: 0.15 to 0.60 (roughly 8° to 31°)
-    slope_optimal = np.exp(-((slope_n - 0.35) ** 2) / (2 * 0.15 ** 2))
+    # Optimal slope range: moderate (8° to 31°)
+    # Not too steep (bare rock), not too flat (no transport energy)
+    slope_optimal = np.exp(-((slope_n - 0.35) ** 2) / (2 * 0.18 ** 2))
     
-    # Elevation: gravel deposits at mid-to-low elevations (mountain bases)
-    # Forms proximal to highlands but in depositional zones
-    # Ref: Harvey et al. (2005) "Alluvial fans: geomorphology, sedimentology"
-    elev_factor = np.exp(-((E_norm - 0.35) ** 2) / (2 * 0.20 ** 2))
+    # Elevation: mid-to-low elevations (mountain bases, valleys)
+    elev_factor = np.exp(-((E_norm - 0.35) ** 2) / (2 * 0.22 ** 2))
     
-    # Curvature: gravel accumulates in concave zones (fan surfaces, channel beds)
-    dzdx, dzdy = np.gradient(z_norm)
-    d2x, _ = np.gradient(dzdx)
-    _, d2y = np.gradient(dzdy)
-    curv = d2x + d2y
-    concave_factor = _normalize(np.maximum(curv, 0.0))
+    # Concave zones (channels, fans)
+    if curvature is not None:
+        concave_factor = np.clip(curvature, 0, 1)
+    else:
+        dzdx, dzdy = np.gradient(z_norm)
+        d2x, _ = np.gradient(dzdx)
+        _, d2y = np.gradient(dzdy)
+        curv = d2x + d2y
+        concave_factor = _normalize(np.maximum(curv, 0.0))
     
-    # Combined index: needs both appropriate slope AND position
+    # Combined index
     gravel_index = _normalize(
-        0.45 * slope_optimal +
-        0.30 * elev_factor +
-        0.25 * concave_factor
+        0.40 * channel_factor +    # Channels = gravel
+        0.30 * slope_optimal +     # Moderate slopes
+        0.15 * elev_factor +       # Mountain bases
+        0.15 * concave_factor      # Concave channels
     )
     
-    # Threshold: gravel only forms where conditions are favorable
-    # Below threshold = no gravel deposition
-    gravel_index = np.where(gravel_index > 0.25, gravel_index, 0.0)
+    # Threshold: gravel only where conditions favorable
+    gravel_index = np.where(gravel_index > 0.20, gravel_index, 0.0)
     
-    # Add spatial variability (channel vs interfluve)
+    # Gravel should NOT form in stagnant flat basins
+    if drainage is not None:
+        stagnant_mask = (drainage < 0.2) & (slope_n < 0.1)
+        gravel_index = np.where(stagnant_mask, gravel_index * 0.1, gravel_index)
+    
+    # Add spatial variability
     noise = rng.lognormal(mean=0.0, sigma=float(lognorm_sigma), size=gravel_index.shape)
     gravel_index_noisy = _normalize(gravel_index * noise)
     
@@ -764,56 +915,62 @@ def sand_thickness_field(
     max_sand_m=25.0,
     floor_m=0.0,
     lognorm_sigma=0.25,
+    drainage=None,
+    curvature=None,
 ):
     """
     Compute SAND layer thickness based on terrain characteristics.
     
     Geological basis (Ref: Boggs, 2012; Reading, 1996 "Sedimentary Environments"):
-    - Sand forms in specific LOW-SLOPE, LOW-ELEVATION environments:
-      * Deserts (aeolian dunes): flat, low areas with wind transport
-      * Beaches: coastal low-energy to moderate-energy zones
-      * Riverbanks/point bars: inner bends of meandering rivers
-      * Delta distributaries: low-gradient coastal plains
+    - Sand forms in specific environments controlled by DRAINAGE and SLOPE:
+      * Channels/rivers: HIGH drainage accumulation (coarse bedload)
+      * Beaches/dunes: LOW slope, moderate drainage
+      * Point bars: inner bends of meandering rivers
     
-    Key constraints (Ref: Hjulström, 1935 - grain transport):
-    - Should NOT form on steep mountain slopes (too much energy = gravel)
-    - Should NOT form at very high altitudes (limited sand source)
-    - Prefers flat to gently undulating terrain
-    - Often found in basin margins and coastal lowlands
+    Key terrain controls:
+    - DRAINAGE: High drainage = channels = SAND deposits
+    - SLOPE: Low-moderate slope for deposition
+    - CURVATURE: Concave areas accumulate sand
     
     Stratigraphic position:
-    - Above clay (in coarsening-upward sequences)
-    - Above gravel (in fining-upward sequences)
+    - In channels above gravel
+    - In floodplains above clay/silt
     - Below topsoil
     """
-    # Sand favors LOW slopes (beaches, dunes, riverbanks)
-    # Ref: Nichols (2009) - sand settles when flow velocity drops below ~0.5 m/s
-    low_slope_factor = 1.0 - slope_n  # Maximum on flat terrain
+    # Sand favors CHANNELS (high drainage accumulation)
+    # Ref: Hjulström curve - sand transported at moderate velocities
+    if drainage is not None:
+        channel_factor = drainage ** 0.8  # Strong correlation with drainage
+    else:
+        channel_factor = np.zeros_like(z_norm)
     
-    # Sand favors LOW to MODERATE elevations
-    # Not on high mountains, not in deepest basins (those get clay)
-    # Ref: Galloway & Hobday (1996) "Terrigenous Clastic Depositional Systems"
-    elev_optimal = np.exp(-((E_norm - 0.25) ** 2) / (2 * 0.20 ** 2))
+    # Sand also in LOW slopes (beaches, dunes, floodplains)
+    low_slope_factor = (1.0 - slope_n) ** 0.8
     
-    # Basin margins favor sand (not basin centers = clay, not highlands = gravel/bedrock)
-    # "basin_margin" = intermediate basin values
-    basin_margin = basins * (1.0 - basins)  # peaks at basin edge
+    # Basin margins favor sand (transitional zone)
+    basin_margin = basins * (1.0 - basins) * 2
     basin_margin = _normalize(basin_margin)
+    
+    # Concave areas accumulate sand
+    if curvature is not None:
+        concave_factor = np.clip(curvature, 0, 1)
+    else:
+        concave_factor = np.zeros_like(z_norm)
     
     # Combined sand index
     sand_index = _normalize(
-        0.40 * low_slope_factor +
-        0.35 * elev_optimal +
-        0.25 * basin_margin
+        0.35 * channel_factor +     # Channels = sand
+        0.25 * low_slope_factor +   # Low slopes
+        0.20 * basin_margin +       # Basin margins
+        0.20 * concave_factor       # Concave areas
     )
     
-    # Sand should NOT form on steep slopes (>20° typically)
-    # Ref: Slopes >15-20° are typically too steep for sand accumulation
-    steep_mask = slope_n > 0.45  # ~24° slopes and steeper
+    # Sand should NOT form on steep slopes
+    steep_mask = slope_n > 0.45
     sand_index = np.where(steep_mask, sand_index * 0.1, sand_index)
     
-    # Sand should NOT form at very high elevations
-    high_elev_mask = E_norm > 0.75
+    # Sand should NOT form at very high elevations (unless channel)
+    high_elev_mask = (E_norm > 0.75) & (channel_factor < 0.5)
     sand_index = np.where(high_elev_mask, sand_index * 0.15, sand_index)
     
     # Add spatial variability
@@ -829,54 +986,68 @@ def clay_thickness_field(
     max_clay_m=20.0,
     floor_m=0.0,
     lognorm_sigma=0.20,
+    drainage=None,
+    curvature=None,
 ):
     """
     Compute CLAY layer thickness based on terrain characteristics.
     
     Geological basis (Ref: Boggs, 2012; Potter et al., 2005 "Mud and Mudstones"):
-    - Clay forms in LOW-ENERGY, FLAT environments:
+    - Clay forms in LOW-ENERGY, STAGNANT WATER environments:
       * Floodplains (overbank deposits)
       * Lakes (lacustrine settings)
-      * Ocean basins (hemipelagic settling)
-      * Estuaries (tidal flats)
       * Swamps and marshes
     
-    Key constraints (Ref: Stokes' Law - settling velocity):
-    - Clay particles settle only in STILL or very slow-moving water
-    - Requires protected, low-energy environments
-    - Cannot form on slopes (particles stay in suspension)
-    - Most common in basin centers and floodplain depressions
+    Key terrain controls:
+    - DRAINAGE: LOW drainage = stagnant water = CLAY deposits
+    - SLOPE: VERY flat for fine settling (Stokes' Law)
+    - CURVATURE: Concave basins trap fine sediments
     
     Stratigraphic position:
-    - Can appear above or below sand (depending on depositional history)
-    - Should NOT appear above gravel (energy regime incompatible)
-    - Below topsoil/organic layers
+    - Below sand in most sequences
+    - NOT in active channels (too much energy)
     """
-    # Clay requires VERY FLAT terrain (low energy for fine settling)
+    # Clay requires STAGNANT water (LOW drainage)
     # Ref: McCave (1984) "Size spectra of suspended particles"
-    flat_factor = (1.0 - slope_n) ** 2  # Strongly favors flat areas
+    if drainage is not None:
+        stagnant_factor = (1.0 - drainage) ** 1.5  # Inverse of drainage
+    else:
+        stagnant_factor = np.ones_like(z_norm) * 0.5
     
-    # Clay favors LOW elevations (basin floors, lake beds)
-    low_elev_factor = 1.0 - E_norm
+    # Clay requires VERY FLAT terrain
+    flat_factor = (1.0 - slope_n) ** 2.5  # Strong flat preference
     
-    # Clay favors BASIN CENTERS (deepest, quietest water)
-    # Ref: Walker & James (1992) "Facies Models"
-    basin_center = basins ** 1.5  # Emphasize deeper basins
+    # Clay favors LOW elevations
+    low_elev_factor = (1.0 - E_norm) ** 1.2
+    
+    # Clay favors BASIN CENTERS (concave, quiet water)
+    basin_center = basins ** 1.5
+    
+    # Concave terrain traps fine sediments
+    if curvature is not None:
+        concave_trap = np.clip(curvature, 0, 1) ** 1.2
+    else:
+        concave_trap = np.zeros_like(z_norm)
     
     # Combined clay index
     clay_index = _normalize(
-        0.35 * flat_factor +
-        0.30 * low_elev_factor +
-        0.35 * basin_center
+        0.30 * stagnant_factor +     # Stagnant = clay
+        0.25 * flat_factor +         # Flat terrain
+        0.20 * low_elev_factor +     # Low elevation
+        0.15 * basin_center +        # Basin centers
+        0.10 * concave_trap          # Concave traps
     )
     
     # Clay should NOT form on ANY significant slope
-    # Ref: Even gentle slopes (>5°) prevent clay accumulation
-    slope_penalty = np.where(slope_n > 0.15, 1.0 - (slope_n - 0.15) * 2, 1.0)
-    slope_penalty = np.clip(slope_penalty, 0.05, 1.0)
+    slope_penalty = np.where(slope_n > 0.12, (1.0 - slope_n) ** 2, 1.0)
+    slope_penalty = np.clip(slope_penalty, 0.02, 1.0)
     clay_index = clay_index * slope_penalty
     
-    # Add spatial variability (lake vs channel distinctions)
+    # Clay should NOT form in active channels (high drainage)
+    if drainage is not None:
+        clay_index = np.where(drainage > 0.7, clay_index * 0.1, clay_index)
+    
+    # Add spatial variability
     noise = rng.lognormal(mean=0.0, sigma=float(lognorm_sigma), size=clay_index.shape)
     clay_index_noisy = _normalize(clay_index * noise)
     
@@ -889,48 +1060,59 @@ def silt_thickness_field(
     max_silt_m=15.0,
     floor_m=0.0,
     lognorm_sigma=0.22,
+    drainage=None,
+    curvature=None,
 ):
     """
     Compute SILT layer thickness based on terrain characteristics.
     
     Geological basis (Ref: Boggs, 2012; Talling et al., 2012):
     - Silt is INTERMEDIATE between sand and clay
-    - Forms in slow-moving water bodies:
-      * Lakes (distal deltaic settings)
-      * Estuaries (mid-energy zones)
-      * Overbank/levee deposits on floodplains
-      * Loess accumulation zones (wind-blown silt)
+    - Forms in MODERATE energy environments:
+      * Overbank/levee deposits
+      * Distal deltaic settings
+      * Lake margins
     
-    Key constraints:
-    - Moderate energy: more than clay, less than sand
-    - Often in transitional zones between sand and clay facies
-    - Ref: Walther's Law - silt represents facies transition
-    
-    Stratigraphic position:
-    - Between sand and clay in many sequences
-    - Often in fining-upward sequences above sand
-    - Below topsoil
+    Key terrain controls:
+    - DRAINAGE: Moderate drainage (between channels and stagnant)
+    - SLOPE: Gentle to moderate
+    - Position: Transitional zones (Walther's Law)
     """
-    # Silt favors GENTLE to MODERATE slopes (not as flat as clay needs)
+    # Silt favors MODERATE drainage (not high channels, not stagnant)
+    if drainage is not None:
+        # Peak at intermediate drainage values
+        moderate_drainage = 1.0 - np.abs(drainage - 0.4) * 2
+        moderate_drainage = np.clip(moderate_drainage, 0, 1)
+    else:
+        moderate_drainage = np.ones_like(z_norm) * 0.5
+    
+    # Silt favors GENTLE to MODERATE slopes
     gentle_slope = np.exp(-((slope_n - 0.10) ** 2) / (2 * 0.15 ** 2))
     
     # Silt at LOW to MODERATE elevations
     elev_factor = np.exp(-((E_norm - 0.30) ** 2) / (2 * 0.25 ** 2))
     
-    # Silt in BASIN MARGINS to BASIN INTERIORS (transitional zones)
-    # Not the deepest basin centers (those get clay)
-    basin_transition = basins * (0.3 + 0.7 * (1.0 - basins))
+    # Silt in TRANSITIONAL zones (not deepest basins, not highlands)
+    basin_transition = basins * (1.0 - basins) * 2
     basin_transition = _normalize(basin_transition)
+    
+    # Slightly concave areas
+    if curvature is not None:
+        slight_concave = np.clip(curvature * 0.5 + 0.5, 0, 1)
+    else:
+        slight_concave = np.ones_like(z_norm) * 0.5
     
     # Combined silt index
     silt_index = _normalize(
-        0.35 * gentle_slope +
-        0.30 * elev_factor +
-        0.35 * basin_transition
+        0.25 * moderate_drainage +
+        0.25 * gentle_slope +
+        0.20 * elev_factor +
+        0.15 * basin_transition +
+        0.15 * slight_concave
     )
     
-    # Silt should not form on steep slopes (>15°)
-    steep_penalty = np.where(slope_n > 0.35, 0.3, 1.0)
+    # Silt should not form on steep slopes
+    steep_penalty = np.where(slope_n > 0.35, 0.2, 1.0)
     silt_index = silt_index * steep_penalty
     
     # Add spatial variability
@@ -1293,6 +1475,16 @@ def generate_stratigraphy(
     covered = 1.0 - bedrock_exp  # Where sediment can accumulate
 
     # ================================================================
+    # COMPUTE TERRAIN PARAMETERS FOR LAYER GENERATION
+    # ================================================================
+    # Curvature, drainage, and terrain classification
+    # These are used by the sediment thickness functions
+    
+    terrain_params = compute_terrain_parameters(E, E_norm, pixel_scale_m, rng)
+    curvature = terrain_params["curvature"]
+    drainage = terrain_params["drainage_accum"]
+
+    # ================================================================
     # NEAR-SURFACE SEDIMENT LAYERS (terrain-driven)
     # ================================================================
     # These follow realistic depositional constraints
@@ -1315,41 +1507,48 @@ def generate_stratigraphy(
     
     # ---------- SAND LAYER ----------
     # Ref: Nichols (2009); Galloway & Hobday (1996)
-    # LOW-SLOPE, LOW-ELEVATION only (beaches, riverbanks, deserts)
+    # Controlled by DRAINAGE (channels = sand) and slope
     t_sand = sand_thickness_field(
         z_norm, E_norm, slope_n, basins, rng,
-        max_sand_m=25.0, floor_m=0.0
+        max_sand_m=25.0, floor_m=0.0,
+        drainage=drainage,
+        curvature=curvature
     )
     # Sand cannot form where bedrock is exposed
     t_sand = t_sand * covered
     
     # ---------- SILT LAYER ----------
     # Ref: Talling et al. (2012); Walker & James (1992)
-    # Intermediate energy: lakes, estuaries, levees
+    # Intermediate energy: moderate drainage, transitional zones
     t_silt = silt_thickness_field(
         z_norm, E_norm, slope_n, basins, rng,
-        max_silt_m=15.0, floor_m=0.0
+        max_silt_m=15.0, floor_m=0.0,
+        drainage=drainage,
+        curvature=curvature
     )
     t_silt = t_silt * covered
     
     # ---------- CLAY LAYER ----------
     # Ref: Potter et al. (2005); McCave (1984)
-    # FLAT, LOW-ENERGY only (floodplains, lakes, basins)
+    # LOW drainage (stagnant water), FLAT terrain
     t_clay = clay_thickness_field(
         z_norm, E_norm, slope_n, basins, rng,
-        max_clay_m=20.0, floor_m=0.0
+        max_clay_m=20.0, floor_m=0.0,
+        drainage=drainage,
+        curvature=curvature
     )
     t_clay = t_clay * covered
     
     # ---------- GRAVEL LAYER ----------
     # Ref: Blair & McPherson (1994); Harvey et al. (2005)
-    # HIGH-ENERGY, MODERATE SLOPES (alluvial fans, river channels)
+    # HIGH drainage (channels), moderate slopes
     t_gravel = gravel_thickness_field(
         z_norm, E_norm, slope_n, rng,
-        max_gravel_m=8.0, floor_m=0.0
+        max_gravel_m=8.0, floor_m=0.0,
+        drainage=drainage,
+        curvature=curvature
     )
     # Gravel CAN form at bedrock contact (lag deposits)
-    # But reduced thickness where bedrock fully exposed
     t_gravel = t_gravel * (0.3 + 0.7 * covered)
 
     # ================================================================
@@ -1416,16 +1615,31 @@ def generate_stratigraphy(
 
 
     # ================================================================
-    # WEDGE-SHAPED STRATIGRAPHY (BASIN-CENTERED DEEPENING)
+    # TERRAIN-DRIVEN STRATIGRAPHY
     # ================================================================
-    # Ref: Sequence Stratigraphy (Vail et al., 1977; Posamentier & Allen, 1999)
+    # Ref: Wilson & Gallant (2000) "Terrain Analysis"
     # 
-    # KEY GEOLOGICAL PRINCIPLE:
-    # - Sedimentary packages are WEDGE-SHAPED, not uniform
-    # - Thickest in basins (accommodation space), thin on highlands
-    # - Basement "bows downward" under basins due to sediment loading
-    # - Crystalline rocks only exposed in eroded mountain cores
+    # KEY GEOLOGICAL PRINCIPLES:
+    # 1. Curvature controls deposition: concave=accumulation, convex=erosion
+    # 2. Prominence controls exposure: high prominence=crystalline exposed
+    # 3. Drainage controls sediment type: channels=coarse, stagnant=fine
+    # 4. Each layer type has specific terrain requirements
     # ================================================================
+
+    # ---------- COMPUTE TERRAIN PARAMETERS ----------
+    terrain = compute_terrain_parameters(E, E_norm, pixel_scale_m, rng)
+    
+    curvature = terrain["curvature"]           # -1 to 1: neg=convex, pos=concave
+    prominence = terrain["prominence"]          # 0 to 1: 0=valley, 1=peak
+    drainage = terrain["drainage_accum"]        # 0 to 1: high=channel
+    is_basin = terrain["is_basin"]
+    is_ridge = terrain["is_ridge"]
+    is_channel = terrain["is_channel"]
+    is_steep = terrain["is_steep"]
+    is_flat = terrain["is_flat"]
+    is_mountain_flank = terrain["is_mountain_flank"]
+    is_alluvial_fan = terrain["is_alluvial_fan"]
+    is_interior_basin = terrain["is_interior_basin"]
 
     # ---------- 2) Structural plane for sedimentary cover ----------
     ii, jj = np.meshgrid(np.arange(N), np.arange(N), indexing="ij")
@@ -1440,37 +1654,76 @@ def generate_stratigraphy(
     bed_struct = plane + undul
     bed_struct_zm = bed_struct - np.mean(bed_struct)
 
-    # ---------- 3) BASIN-CONTROLLED SEDIMENTARY THICKNESS ----------
-    # Ref: Allen & Allen (2013) "Basin Analysis: Principles and Application"
-    # 
-    # Sediment accumulates in ACCOMMODATION SPACE:
-    # - Basins = high accommodation = THICK sediment packages
-    # - Highlands = low accommodation = THIN or ABSENT sediments
-    # - This creates WEDGE-SHAPED stratigraphy
-    
     elev_span = float(E.max() - E.min() + 1e-9)
+
+    # ================================================================
+    # DEPOSITION vs EROSION ZONES
+    # ================================================================
+    # Ref: Zevenbergen & Thorne (1987)
+    # Concave terrain = deposition (sediment accumulates)
+    # Convex terrain = erosion (sediment removed)
     
-    # Basin depth factor: how much deeper basins are than highlands
-    # This controls the "wedge shape" of stratigraphy
-    # basins = 1 in lows, 0 on highs
-    basin_depth_factor = basins ** 1.5  # Emphasize basin centers
-    
-    # Highland exposure factor: where erosion removes cover
-    # steep + high = exposed crystalline core
-    highland_exposure = highs * slope_n
-    highland_exposure = _normalize(highland_exposure)
-    
-    # Sedimentary package thickness multiplier
-    # DRAMATICALLY varies from basin (thick) to highland (thin/absent)
-    # Ref: Sediment thickness can vary 10x or more across a basin margin
-    sed_thickness_multiplier = np.clip(
-        0.1 + 2.5 * basin_depth_factor - 1.5 * highland_exposure,
-        0.05,  # Minimum on exposed highlands
-        3.0    # Maximum in deep basins
+    # Deposition factor: high in concave basins, low on convex ridges
+    deposition_factor = np.clip(
+        0.5 + 0.5 * curvature +    # Concave adds, convex subtracts
+        0.3 * (1.0 - slope_n) +     # Gentle slopes accumulate
+        0.2 * (1.0 - E_norm),       # Low elevation accumulates
+        0.0, 1.0
     )
     
-    # Base sedimentary package thickness (before basin modification)
-    base_sed_thickness_m = 150.0  # meters
+    # Erosion factor: high on steep convex ridges
+    erosion_factor = np.clip(
+        0.5 * slope_n +             # Steep = erosion
+        0.3 * (-curvature) +        # Convex = erosion
+        0.2 * prominence,           # Prominent peaks = erosion
+        0.0, 1.0
+    )
+    erosion_factor = _normalize(erosion_factor)
+    
+    # ================================================================
+    # CRYSTALLINE EXPOSURE CONTROL
+    # ================================================================
+    # Crystalline rocks (granite, gneiss, basalt) ONLY exposed where:
+    # 1. HIGH elevation AND
+    # 2. HIGH slope AND
+    # 3. HIGH local prominence (mountain cores)
+    # NEVER in flat basins or low valleys
+    #
+    # Ref: Mountain building exposes crystalline basement only in
+    # deeply eroded, tectonically uplifted cores
+    
+    crystalline_exposure = np.clip(
+        # Must have ALL THREE conditions
+        prominence *                    # High relative to neighbors
+        slope_n *                       # Steep (eroded)
+        E_norm *                        # High elevation
+        (1.0 - deposition_factor),      # Not in deposition zone
+        0.0, 1.0
+    )
+    # Enforce: NEVER exposed in basins or flat areas
+    crystalline_exposure = np.where(is_basin | is_flat | is_interior_basin, 0.0, crystalline_exposure)
+    crystalline_exposure = np.where(E_norm < 0.4, crystalline_exposure * 0.1, crystalline_exposure)
+    crystalline_exposure = _normalize(crystalline_exposure)
+    
+    # Basin depth factor (for sediment thickness)
+    basin_depth_factor = deposition_factor ** 1.5
+
+    # ================================================================
+    # SEDIMENTARY PACKAGE THICKNESS (TERRAIN-CONTROLLED)
+    # ================================================================
+    # Thickness varies based on:
+    # - Curvature: concave = thick, convex = thin
+    # - Elevation: low = thick, high = thin (unless uplifted sediments)
+    # - Slope: gentle = thick (accumulation), steep = thin (erosion)
+    
+    # Base multiplier driven by terrain
+    sed_thickness_multiplier = np.clip(
+        0.05 +                              # Minimum everywhere
+        2.0 * deposition_factor -           # Thick in deposition zones
+        1.5 * erosion_factor,               # Thin in erosion zones
+        0.02,  # Minimum on exposed ridges
+        3.0    # Maximum in deep basins
+    )
     
     # Helper: smoothed random field
     def smooth_random_field(k):
@@ -1480,40 +1733,100 @@ def generate_stratigraphy(
     k_thick = max(15, int(0.06 * N) | 1)
     
     # ================================================================
-    # FACIES-CONTROLLED SEDIMENTARY UNIT THICKNESSES
+    # TERRAIN-SPECIFIC SEDIMENTARY UNIT THICKNESSES
     # ================================================================
-    # Each unit responds to position in the basin system
     
-    # CONGLOMERATE: Mountain margins, alluvial fans
-    # Thickest near highlands, absent in basin centers
+    # ---------- CONGLOMERATE ----------
     # Ref: Blair & McPherson (1994) "Alluvial fans"
-    conglom_env = _normalize(highs * (1.0 - basin_depth_factor) * (0.3 + 0.7 * slope_n))
-    t_conglomerate = 40.0 * conglom_env * sed_thickness_multiplier
+    # WHERE: Alluvial fans at base of mountains, proximal deposits
+    # NOT: Basin centers, flat areas, ridge tops
+    conglom_env = np.where(
+        is_alluvial_fan,
+        0.8 + 0.2 * slope_n,  # Strong in alluvial fan zones
+        np.where(
+            is_mountain_flank,
+            0.4 + 0.3 * slope_n,  # Moderate on mountain flanks
+            0.1 * slope_n  # Minimal elsewhere
+        )
+    )
+    conglom_env = _normalize(conglom_env) * sed_thickness_multiplier
+    t_conglomerate = 50.0 * conglom_env
     
-    # SANDSTONE: Basin margins, shorelines, river channels
-    # Intermediate position between highlands and basin centers
-    sand_env = _normalize(basins * (1.0 - basins) * (0.4 + 0.6 * slope_n))
-    t_sandstone = 80.0 * (0.2 + 0.8 * sand_env) * sed_thickness_multiplier
+    # ---------- SANDSTONE ----------
+    # Ref: Can appear in BOTH basins AND highlands
+    # Basin: fluvial/deltaic fill
+    # Highland: uplifted ancient dunes, beach deposits, fluvial channels
+    # WHERE: Basin margins, channels, mountain flanks
+    sand_basin = basins * (1.0 - basins) * 2  # Peak at basin margins
+    sand_channel = drainage * (1.0 - is_interior_basin.astype(float))  # Channels
+    sand_highland = is_mountain_flank.astype(float) * 0.5  # Uplifted sediments
     
-    # SHALE/MUDSTONE: Basin centers, offshore, lakes
-    # Thickest in deepest, flattest parts of basins
-    shale_env = _normalize(basin_depth_factor * gentle)
-    t_shale_rock = 100.0 * (0.1 + 0.9 * shale_env) * sed_thickness_multiplier
+    sand_env = _normalize(sand_basin + sand_channel + sand_highland)
+    t_sandstone = 100.0 * (0.1 + 0.9 * sand_env) * sed_thickness_multiplier
     
-    # SILTSTONE: Transitional, prodelta, distal fan
-    silt_env = _normalize(basins * (0.5 + 0.5 * gentle))
-    t_siltstone_rock = 50.0 * (0.2 + 0.8 * silt_env) * sed_thickness_multiplier
+    # ---------- SHALE/MUDSTONE ----------
+    # Ref: Walker & James (1992) "Facies Models"
+    # WHERE: Basin centers, offshore, lakes - LOW ENERGY environments
+    # NOT: Channels, steep slopes, ridges
+    shale_env = np.where(
+        is_basin | is_interior_basin,
+        0.8 + 0.2 * gentle,  # Strong in basins
+        np.where(
+            is_flat & (E_norm < 0.5),
+            0.4 + 0.2 * gentle,  # Moderate in flat low areas
+            0.1 * gentle  # Minimal on slopes/ridges
+        )
+    )
+    shale_env = _normalize(shale_env)
+    t_shale_rock = 120.0 * shale_env * sed_thickness_multiplier
     
-    # LIMESTONE/DOLOMITE: Shallow marine platforms, gentle slopes
-    # Only in stable, low areas with clear water
-    lime_env = _normalize(basins * gentle * (1.0 - slope_n))
-    t_limestone_rock = 60.0 * (0.1 + 0.9 * lime_env) * sed_thickness_multiplier
-    t_dolomite_rock = 30.0 * lime_env * sed_thickness_multiplier
+    # ---------- SILTSTONE ----------
+    # WHERE: Transitional zones, prodelta, distal fans
+    silt_env = _normalize(
+        0.4 * deposition_factor +
+        0.3 * (1.0 - drainage) +  # Low drainage = fine sediment settles
+        0.3 * gentle
+    )
+    t_siltstone_rock = 60.0 * silt_env * sed_thickness_multiplier
     
-    # EVAPORITE: Restricted basins only (rare)
-    # Only in deepest, most enclosed basins
-    evap_env = _normalize((basin_depth_factor ** 2) * (gentle ** 2))
-    t_evaporite_rock = 15.0 * evap_env * sed_thickness_multiplier
+    # ---------- LIMESTONE/DOLOMITE ----------
+    # Ref: Tucker & Wright (1990) "Carbonate Sedimentology"
+    # WHERE: ONLY in flat, interior basins - shallow marine/lacustrine
+    # NOT: Mountains, steep slopes, ridges, channels
+    # Requires: stable, clear water, warm conditions
+    lime_env = np.where(
+        is_interior_basin | (is_flat & is_basin),
+        0.7 + 0.3 * gentle,  # Strong only in interior basins
+        np.where(
+            is_flat & (E_norm < 0.4),
+            0.2 * gentle,  # Weak in other flat low areas
+            0.0  # ZERO on mountains, ridges, slopes
+        )
+    )
+    lime_env = _normalize(lime_env)
+    # Enforce: NO limestone on high ground or steep slopes
+    lime_env = np.where((E_norm > 0.5) | (slope_n > 0.25), lime_env * 0.05, lime_env)
+    t_limestone_rock = 80.0 * lime_env * sed_thickness_multiplier
+    t_dolomite_rock = 40.0 * lime_env * sed_thickness_multiplier
+    
+    # ---------- EVAPORITE ----------
+    # Ref: Warren (2006) "Evaporites"
+    # WHERE: ONLY in restricted, enclosed, interior basins
+    # Requires: arid climate, restricted water circulation
+    # NOT: Mountains, channels, anywhere with water flow
+    evap_env = np.where(
+        is_interior_basin,
+        0.8,  # Only in interior basins
+        0.0   # ZERO everywhere else
+    )
+    # Extra restriction: must be very flat and very low
+    evap_env = np.where(
+        (slope_n < 0.05) & (E_norm < 0.2),
+        evap_env,
+        evap_env * 0.1
+    )
+    evap_env = _normalize(evap_env)
+    t_evaporite_rock = 20.0 * evap_env * sed_thickness_multiplier
     
     # Add quantum-smoothed variability to each unit
     rnd_cong = smooth_random_field(k_thick)
@@ -1561,7 +1874,8 @@ def generate_stratigraphy(
     
     # Highland uplift: basement rises toward surface under highlands
     # But should still be covered except in eroded cores
-    highland_rise = 200.0 * highland_exposure
+    # Use crystalline_exposure (defined earlier in terrain-driven section)
+    highland_rise = 200.0 * crystalline_exposure
     
     # Basement top elevation (relative to surface)
     # Negative = below surface, more negative = deeper
@@ -1595,43 +1909,46 @@ def generate_stratigraphy(
     top_basement_floor = np.full_like(top_basement, z_floor)
     
     # ================================================================
-    # CRYSTALLINE ROCK EXPOSURE LOGIC
+    # CRYSTALLINE ROCK EXPOSURE LOGIC (TERRAIN-DRIVEN)
     # ================================================================
-    # Ref: Crystalline rocks (granite, gneiss, basalt) are only exposed:
-    # - In deeply eroded mountain CORES (steep + high)
-    # - Where sedimentary cover has been completely removed
-    # - They should be DEEP and HIDDEN under basins
+    # Ref: Crystalline rocks (granite, gneiss, basalt) are exposed ONLY where:
+    # 1. HIGH elevation (mountain regions)
+    # 2. HIGH slope (eroded terrain)
+    # 3. HIGH local prominence (tectonic highs, not valleys)
     # 
-    # KEY: Use highland_exposure to control where crystalline appears
+    # They should be:
+    # - DEEP and HIDDEN under basins (hundreds of meters)
+    # - EXPOSED only in steep, eroded mountain cores
+    # - NEVER visible in flat basins or low valleys
+    # ================================================================
     
-    # Calculate how much crystalline rock column exists
-    # In basins: thick crystalline column BUT all below sediments
-    # On highlands: thinner but potentially exposed
+    # Calculate crystalline rock column thickness
+    # In basins: thick column but ALL below sediments
+    # On highlands: can be exposed at surface if eroded
     
-    # Crystalline thickness varies inversely with sediment cover
     max_crystalline_thick = 400.0  # Maximum crystalline column
     min_crystalline_thick = 100.0  # Minimum (always some basement)
     
-    # More crystalline exposed where highlands are steep and eroded
+    # Crystalline thickness: more where erosion_factor is high (exposed areas)
     crystalline_thickness = (
         min_crystalline_thick + 
-        (max_crystalline_thick - min_crystalline_thick) * (1.0 - basin_depth_factor)
+        (max_crystalline_thick - min_crystalline_thick) * (1.0 - deposition_factor)
     )
     
-    # Partition crystalline into types based on position
-    # Mountain cores: more granite/gneiss
-    # Basin margins: potentially more basalt (rifting)
-    f_granite_raw = 0.40 + 0.20 * highland_exposure - 0.10 * basins
-    f_gneiss_raw = 0.35 + 0.15 * highland_exposure
-    f_basalt_raw = 0.10 + 0.15 * basins  # Slightly more in rift basins
+    # Partition crystalline into types based on terrain
+    # Mountain cores (high prominence): more granite/gneiss
+    # Basin margins (some rifting): potentially more basalt
+    f_granite_raw = 0.40 + 0.20 * crystalline_exposure - 0.10 * deposition_factor
+    f_gneiss_raw = 0.35 + 0.15 * crystalline_exposure + 0.10 * prominence
+    f_basalt_raw = 0.10 + 0.10 * deposition_factor  # Slightly more in basins (rifts)
     f_ancient_raw = 0.15
     
     # Normalize fractions
-    f_total = f_granite_raw + f_gneiss_raw + f_basalt_raw + f_ancient_raw
+    f_total = f_granite_raw + f_gneiss_raw + f_basalt_raw + f_ancient_raw + 1e-9
     f_granite = np.clip(f_granite_raw / f_total, 0.05, 0.60)
     f_gneiss = np.clip(f_gneiss_raw / f_total, 0.05, 0.50)
     f_basalt = np.clip(f_basalt_raw / f_total, 0.02, 0.25)
-    f_ancient = 1.0 - f_granite - f_gneiss - f_basalt
+    f_ancient = np.clip(1.0 - f_granite - f_gneiss - f_basalt, 0.05, 0.40)
     
     # Crystalline layer thicknesses
     t_granite_cryst = crystalline_thickness * f_granite
@@ -1696,7 +2013,7 @@ def generate_stratigraphy(
     
     # Limit sedimentary rock tops to not exceed gravel base
     # UNLESS we're in an exposed highland area
-    exposure_allowance = highland_exposure * 50.0  # Allow up to 50m exposure on steep highlands
+    exposure_allowance = crystalline_exposure * 50.0  # Allow up to 50m exposure on steep highlands
     
     # IMPORTANT: In flat basins, NEVER allow rock exposure
     # Flat basin = basins > 0.5 AND slope_n < 0.2
