@@ -1023,14 +1023,14 @@ def generate_stratigraphy(
   elev_range_m=700.0,
   pixel_scale_m=10.0,
   soil_range_m=(0.3, 1.8),
-  # Colluvium controls
-  colluvium_max_m=18.0,
+  # Colluvium controls (INCREASED)
+  colluvium_max_m=40.0,
   wC_gentle=0.35, wC_curv=0.30, wC_low=0.20, wC_twi=0.15,
   C_relief_px=31, C_twi_k1=7, C_twi_k2=13, C_sigma=0.20, C_floor=0.5, C_bias=1.0,
   # Saprolite controls (INCREASED for visible weathering mantle)
-  sap_median=12.0, sap_min=2.0, sap_max=40.0, sap_w_gentle=0.6, sap_w_inter=0.4, sap_relief_px=61, sap_sigma=0.35,
-  # Weathered rind controls
-  rind_median=1.8, rind_min=0.4, rind_max=6.0, rind_patch_beta=3.0, rind_patch_alpha=0.5,
+  sap_median=20.0, sap_min=5.0, sap_max=60.0, sap_w_gentle=0.6, sap_w_inter=0.4, sap_relief_px=61, sap_sigma=0.35,
+  # Weathered rind controls (INCREASED)
+  rind_median=5.0, rind_min=1.0, rind_max=15.0, rind_patch_beta=3.0, rind_patch_alpha=0.5,
   # Competent rock package (relative proportions)
   unit_thickness_m=(90.0,110.0,100.0),  # sandstone, shale, limestone
   undulation_amp_m=10.0, undulation_beta=3.2,
@@ -1139,11 +1139,21 @@ def generate_stratigraphy(
   sed_frac  = 0.35
   sed_total = sed_frac * crust_thick
 
-  # Very coarse topographic smooth to define PALEO basins vs highs
-  k_coarse = max(31, int(0.15 * N) | 1)
-  z_smooth = _box_blur(z_norm, k=k_coarse)
-  basins   = _normalize(1.0 - z_smooth)   # 1 in lows, 0 on highs  ← KEY FOR BASIN THICKENING
-  highs    = _normalize(z_smooth)         # 1 on highs
+  # CRITICAL FIX: Basin field must be INDEPENDENT of current topography
+  # Real geology: Structural basins (thick sediment) can be UPLIFTED to become current plateaus
+  # Current lows (valleys) are often EROSIONAL, cutting through thin cover to basement
+  
+  # Create INDEPENDENT structural/subsidence field (NOT tied to current elevation)
+  k_structural = max(31, int(0.2 * N) | 1)
+  
+  # Option 1: Use smoothed quantum noise (independent of topography)
+  structural_noise = fractional_surface(N, beta=3.5, rng=rng)
+  structural_field = _box_blur(structural_noise, k=k_structural)
+  
+  # Basin = where structural field is LOW (subsided areas)
+  # These can be at ANY current elevation (basins can be uplifted!)
+  basins = _normalize(1.0 - structural_field)  # Structural lows
+  highs  = _normalize(structural_field)        # Structural highs
 
   # Present slope – steeper = more erosion, so thinner preserved cover.
   gentle    = 1.0 - slope_norm
@@ -1176,17 +1186,23 @@ def generate_stratigraphy(
 
   k_thick = max(15, int(0.06 * N) | 1)
 
-  # SIMPLIFIED: Direct basin control on total sediment capacity
-  # sed_total should be LARGE in basins, SMALL on highs (not tied to crust_thick)
-  sed_base = 50.0  # Minimum sediment thickness (m)
-  sed_max = 500.0  # Maximum in deepest basins (m)
-  sed_total_simplified = sed_base + sed_max * basins  # Direct basin control
+  # CRITICAL FIX: Sediment thickness ONLY from structural basin field
+  # NOT from current elevation (basins can be uplifted to high plateaus)
+  sed_base = 20.0   # Minimum on structural highs (m)
+  sed_max = 600.0   # Maximum in structural basins (m)
+  sed_total = sed_base + sed_max * basins  # ONLY basin control (not elevation!)
   
-  # Each facies gets its fraction of available space, multiplied by favorability
-  # NO artificial floor (0.4 + 0.6*env) - let it go to ZERO where unfavorable
-  base_sand  = sed_total_simplified * f_sand  * sand_env  # Can be ZERO
-  base_shale = sed_total_simplified * f_shale * shale_env
-  base_lime  = sed_total_simplified * f_lime  * lime_env
+  # Each facies gets its fraction, but with SPATIAL VARIABILITY
+  # Sandstone should be PATCHY (present in some areas, absent in others)
+  
+  # Add spatial patchiness to sandstone (makes it non-uniform)
+  sand_patchiness = fractional_surface(N, beta=3.0, rng=rng)
+  sand_patchiness = _normalize(sand_patchiness)
+  sand_patch_mask = sand_patchiness > 0.4  # Only present in 60% of areas
+  
+  base_sand  = sed_total * f_sand  * sand_env * sand_patch_mask.astype(float)  # Can be ZERO
+  base_shale = sed_total * f_shale * shale_env
+  base_lime  = sed_total * f_lime  * lime_env
 
   # Quantum-smoothed variability
   rnd_sand  = smooth_random_field(k_thick)
@@ -1258,12 +1274,14 @@ def generate_stratigraphy(
   top_sand = top_silt - t_silt
 
   # ========== CRITICAL: ADD POST-DEPOSITIONAL EROSION ==========
-  # This removes the "sandstone blanket" by stripping material from peaks
-  # Mountains expose deeper units; valleys preserve full section
+  # This removes sediment from CURRENT high ground (which may have thick paleo-basin fill)
+  # Erosion controlled by CURRENT elevation + slope (not paleo-structure)
   
-  # Erosion depth: proportional to relative elevation + slope
-  E_rel = (E - E.mean()) / (E.std() + 1e-9)  # Relative elevation
-  erosion_depth = np.maximum(0, 50.0 * E_rel + 100.0 * slope_norm)  # 0-200m removed from peaks
+  # Erosion depth: proportional to CURRENT elevation + slope
+  E_rel = (E - E.mean()) / (E.std() + 1e-9)  # Relative CURRENT elevation
+  
+  # Strong erosion on current highs (even if they have thick paleo-sediment from uplifted basin)
+  erosion_depth = np.maximum(0, 150.0 * E_rel + 200.0 * slope_norm)  # 0-400m removed from current peaks
   erosion_depth = _box_blur(erosion_depth, k=7)  # Smooth erosion pattern
   
   # Apply erosion to sediment tops (lowers the top of each unit)
@@ -1900,11 +1918,11 @@ if __name__ == "__main__":
     strata = generate_stratigraphy(
         z_norm=z, rng=rng,
         elev_range_m=700.0, pixel_scale_m=10.0,
-        soil_range_m=(2.0, 8.0),  # INCREASED
-        colluvium_max_m=18.0, wC_gentle=0.35, wC_curv=0.30, wC_low=0.20, wC_twi=0.15,
+        soil_range_m=(5.0, 25.0),  # INCREASED
+        colluvium_max_m=40.0,  # INCREASED wC_gentle=0.35, wC_curv=0.30, wC_low=0.20, wC_twi=0.15,
         C_relief_px=31, C_twi_k1=7, C_twi_k2=13, C_sigma=0.20, C_floor=0.5, C_bias=1.0,
-        sap_median=12.0, sap_min=2.0, sap_max=40.0,  # INCREASED sap_w_gentle=0.6, sap_w_inter=0.4, sap_relief_px=61, sap_sigma=0.35,
-        rind_median=1.8, rind_min=0.4, rind_max=6.0, rind_patch_beta=3.0, rind_patch_alpha=0.5,
+        sap_median=20.0, sap_min=5.0, sap_max=60.0,  # INCREASED sap_w_gentle=0.6, sap_w_inter=0.4, sap_relief_px=61, sap_sigma=0.35,
+        rind_median=5.0, rind_min=1.0, rind_max=15.0,  # INCREASED rind_patch_beta=3.0, rind_patch_alpha=0.5,
         unit_thickness_m=(90.0,110.0,100.0),
         undulation_amp_m=10.0, undulation_beta=3.2,
         dip_deg=6.0, dip_dir_deg=45.0,
