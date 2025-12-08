@@ -1053,22 +1053,46 @@ def generate_stratigraphy(
   # ========== STRATIGRAPHIC INTERFACE CALCULATION ==========
   # Enforce proper stacking: Topsoil → Sand/Silt → Clay → Gravel → Bedrock
   # Reference: Principles of Sedimentology and Stratigraphy (Boggs)
+  # CRITICAL: All layers must be BELOW the surface elevation E
   
   Emean       = float(E.mean())
   crust_mean  = float(crust_thick.mean())
   crust_anom  = (crust_thick - crust_mean) / (crust_mean + 1e-9)
 
+  # ========== MOUNTAIN vs LOWLAND LITHOLOGY LOGIC ==========
+  # Mountains: High elevation + steep slopes → expose igneous/metamorphic rocks
+  # Lowlands: Thick sedimentary cover, basement deep
+  mountain_mask = (E_norm > 0.6) & (slope_n > 0.4)  # High, steep = mountains
+  lowland_mask = (E_norm < 0.4) & (slope_n < 0.3)   # Low, gentle = lowlands
+  
+  # In mountains: reduce sedimentary cover, expose basement/metamorphic rocks
+  # In lowlands: thick sedimentary sequences, basement deep
+  mountain_erosion_factor = np.where(mountain_mask, 0.3, 1.0)  # Mountains have less sediment
+  lowland_sediment_factor = np.where(lowland_mask, 1.5, 1.0)   # Lowlands have more sediment
+  
   # Base reference depth for sedimentary layers
   # Deeper sediment stack under thicker crust (mountain belts), shallower under thinner crust
+  # In mountains, basement is closer to surface due to erosion
+  # In lowlands, basement is deep due to sediment accumulation
+  base_burial = np.where(
+      mountain_mask,
+      burial_depth_m * 0.2,  # Mountains: basement shallow (eroded)
+      burial_depth_m * 1.5   # Lowlands: basement deep (sediment accumulation)
+  )
+  
   top_sed_ref = (
-      (Emean - burial_depth_m)
-      - 0.3 * crust_anom * elev_span
+      (Emean - base_burial)
+      - 0.3 * crust_anom * elev_span * mountain_erosion_factor
       + bed_struct_weight * bed_struct_zm
   )
+  
+  # Ensure sedimentary reference is well below surface
+  top_sed_ref = np.minimum(top_sed_ref, E - 50.0)  # At least 50m below surface
 
   # ---------- 5) REGOLITH STACK ABOVE SEDIMENTARY LAYERS ----------
   # Topsoil appears at surface only, forms only in moderate slope and stable terrain
   # Should not appear on steep cliffs or raw rock faces
+  # CRITICAL: All layers must be BELOW surface elevation E
   eps = 0.01
 
   # A and B horizons (Topsoil and Subsoil)
@@ -1077,19 +1101,39 @@ def generate_stratigraphy(
   steep_cliff_mask = slope_n > 0.7  # Very steep slopes (>70% normalized)
   topsoil_thick_adjusted = np.where(steep_cliff_mask, topsoil_thick * 0.1, topsoil_thick)
   
+  # In mountains, reduce regolith thickness (erosion dominates)
+  topsoil_thick_adjusted = topsoil_thick_adjusted * np.where(mountain_mask, 0.3, 1.0)
+  subsoil_thick_adjusted = subsoil_thick * np.where(mountain_mask, 0.3, 1.0)
+  
+  # Surface is E, all layers below it
   top_topsoil   = E
   top_subsoil   = top_topsoil   - topsoil_thick_adjusted
-  top_colluvium = top_subsoil   - subsoil_thick
+  top_colluvium = top_subsoil   - subsoil_thick_adjusted
 
   # Colluvium, saprolite, weathered rind
-  top_saprolite = top_colluvium - tC
-  top_rind      = top_saprolite - tS
+  # In mountains, these are thinner or absent due to erosion
+  tC_adjusted = tC * np.where(mountain_mask, 0.2, 1.0)
+  tS_adjusted = tS * np.where(mountain_mask, 0.3, 1.0)
+  
+  top_saprolite = top_colluvium - tC_adjusted
+  top_rind      = top_saprolite - tS_adjusted
+  
+  # Ensure regolith doesn't go below reasonable depth
+  top_rind = np.maximum(top_rind, E - 20.0)  # Max 20m regolith
 
   # ========== STRATIGRAPHIC STACKING WITH GEOLOGICAL RULES ==========
   # Order from top to bottom: Topsoil → Sand/Silt → Clay → Gravel → Bedrock
   # But allow variations based on depositional environment:
   # - Sand can appear above clay in fluvial/coastal settings
   # - Gravel always lies above bedrock, below fine-grained layers
+  # CRITICAL: All layers must be BELOW surface elevation E
+  
+  # In mountains: minimal valley-fill (erosion dominates)
+  # In lowlands: thick valley-fill sediments
+  t_clay_adjusted = t_clay * np.where(mountain_mask, 0.1, 1.0)
+  t_silt_adjusted = t_silt * np.where(mountain_mask, 0.1, 1.0)
+  t_sand_adjusted = t_sand * np.where(mountain_mask, 0.1, 1.0)
+  t_gravel_adjusted = t_gravel * np.where(mountain_mask, 0.2, 1.0)
   
   # Determine stacking order based on environmental factors
   # In areas with high sand_env and low clay_env: Sand → Clay → Gravel
@@ -1101,70 +1145,176 @@ def generate_stratigraphy(
   clay_dominates = clay_env > sand_env * 1.2
   
   # Valley-fill unconsolidated sediments stack below weathered rind
-  # Clay forms in deepest basins, so it's typically lowest
-  # Sand can be above or below clay depending on environment
-  # Silt is intermediate
-  # Gravel forms above bedrock, below fine-grained layers
-  
-  # Base: start from weathered rind and stack downward
+  # Start from weathered rind and stack downward
   # Clay typically forms first (deepest, quietest water)
-  top_clay = top_rind - t_clay
+  top_clay = top_rind - t_clay_adjusted
   
   # Silt can be above or below clay depending on environment
-  # In fluvial settings, silt may be above clay; in deep basins, clay is deeper
   top_silt = np.where(
       sand_dominates,
-      top_clay - t_silt,  # Silt above clay in high-energy settings
-      top_rind - t_silt   # Silt near top in low-energy settings
+      top_clay - t_silt_adjusted,  # Silt above clay in high-energy settings
+      top_rind - t_silt_adjusted   # Silt near top in low-energy settings
   )
   top_silt = np.minimum(top_silt, top_clay)  # Ensure proper ordering
   
   # Sand can appear above clay in fluvial/coastal settings
   top_sand = np.where(
       sand_dominates,
-      top_rind - t_sand,  # Sand on top in high-energy settings
-      top_silt - t_sand   # Sand below silt/clay in low-energy settings
+      top_rind - t_sand_adjusted,  # Sand on top in high-energy settings
+      top_silt - t_sand_adjusted   # Sand below silt/clay in low-energy settings
   )
   top_sand = np.minimum(top_sand, np.minimum(top_silt, top_clay))
   
   # Gravel always above bedrock, below fine-grained layers
-  # It forms in high-energy environments, so it's typically near the bottom of unconsolidated sediments
-  top_gravel = np.minimum(top_sand, top_clay) - t_gravel
+  top_gravel = np.minimum(top_sand, top_clay) - t_gravel_adjusted
   
-  # Ensure proper ordering: Gravel must be above bedrock
-  top_gravel = np.maximum(top_gravel, top_sed_ref - 50.0)  # At least 50m above deep sediments
+  # Ensure all valley-fill is below surface
+  top_clay = np.minimum(top_clay, E - eps)
+  top_silt = np.minimum(top_silt, E - eps)
+  top_sand = np.minimum(top_sand, E - eps)
+  top_gravel = np.minimum(top_gravel, E - eps)
+  
+  # Find the deepest valley-fill layer
+  top_valley_fill_bottom = np.minimum(np.minimum(top_sand, top_clay), np.minimum(top_silt, top_gravel))
   
   # ---------- 4) DEEPER CONSOLIDATED SEDIMENTARY ROCKS ----------
   # These form below the unconsolidated valley-fill sediments
-  top_sandstone_raw = top_sed_ref
-  top_shale_raw     = top_sandstone_raw - t_sandstone
-  top_limestone_raw = top_shale_raw     - t_shale_rock
-  top_basement_raw  = top_limestone_raw - t_lime_rock  # top of crystalline basement
+  # In mountains: reduce sedimentary thickness, expose igneous/metamorphic
+  # In lowlands: thick sedimentary sequences
+  
+  # Adjust sedimentary rock thickness based on terrain
+  t_sandstone_adjusted = t_sandstone * np.where(mountain_mask, 0.2, lowland_sediment_factor)
+  t_shale_adjusted = t_shale_rock * np.where(mountain_mask, 0.2, lowland_sediment_factor)
+  t_lime_adjusted = t_lime_rock * np.where(mountain_mask, 0.2, lowland_sediment_factor)
+  
+  # Base interfaces for consolidated sedimentary rocks
+  top_sandstone_raw = np.minimum(top_sed_ref, top_valley_fill_bottom - eps)
+  top_shale_raw     = top_sandstone_raw - t_sandstone_adjusted
+  top_limestone_raw = top_shale_raw     - t_shale_adjusted
+  
+  # ========== MOUNTAIN LITHOLOGY VARIETY ==========
+  # In mountains: expose igneous/metamorphic rocks, reduce sedimentary cover
+  # Create varied rock sequences in mountains (granite, gneiss, schist, etc.)
+  
+  # Mountain rock type distribution based on elevation and slope
+  # High, steep mountains → more igneous (granite, diorite)
+  # Moderate mountains → metamorphic (gneiss, schist)
+  mountain_igneous_factor = np.clip((E_norm - 0.6) * (slope_n - 0.4) * 2.0, 0.0, 1.0)
+  mountain_metamorphic_factor = np.clip(E_norm * slope_n * 1.5, 0.0, 1.0)
+  
+  # In mountains, reduce sedimentary package and bring basement/metamorphic closer
+  mountain_sediment_reduction = np.where(mountain_mask, 0.1, 1.0)
+  
+  # Calculate basement depth - deep in lowlands, shallow in mountains
+  # Basement should be hundreds of meters deep in lowlands
+  basement_depth_lowlands = burial_depth_m * 1.5  # ~180m in lowlands
+  basement_depth_mountains = burial_depth_m * 0.3  # ~36m in mountains (eroded)
+  
+  basement_depth = np.where(
+      mountain_mask,
+      basement_depth_mountains,
+      basement_depth_lowlands
+  )
+  
+  top_basement_raw = top_limestone_raw - t_lime_adjusted
+  # Ensure basement is at appropriate depth
+  top_basement_raw = np.minimum(
+      top_basement_raw,
+      E - basement_depth
+  )
   
   # Ensure consolidated rocks stay below unconsolidated sediments and respect ordering
-  top_sandstone = np.minimum(top_sandstone_raw, top_gravel - eps)
+  top_sandstone = np.minimum(top_sandstone_raw, top_valley_fill_bottom - eps)
   top_shale     = np.minimum(top_shale_raw,     top_sandstone - eps)
   top_limestone = np.minimum(top_limestone_raw, top_shale - eps)
   top_basement  = np.minimum(top_basement_raw,  top_limestone - eps)
+  
+  # Ensure ALL layers are below surface
+  top_sandstone = np.minimum(top_sandstone, E - eps)
+  top_shale     = np.minimum(top_shale,     E - eps)
+  top_limestone = np.minimum(top_limestone, E - eps)
+  top_basement  = np.minimum(top_basement,  E - eps)
 
-  # NEW: Add tops of newly added layers here
-  top_conglomerate   = top_shale - 20
-  top_mudstone       = top_conglomerate - 25
-  top_siltstone      = top_mudstone - 20
-  top_dolomite       = top_siltstone - 15
-  top_evaporite      = top_dolomite - 10
+  # Add intermediate sedimentary layers with proper thickness
+  # Conglomerate: forms in high-energy settings, often in mountains
+  t_conglomerate = np.where(mountain_mask, 15.0, 10.0) * gravel_env
+  top_conglomerate = top_shale - t_conglomerate
+  
+  # Mudstone: fine-grained, deep basins
+  t_mudstone = np.where(mountain_mask, 5.0, 20.0) * clay_env
+  top_mudstone = top_conglomerate - t_mudstone
+  
+  # Siltstone: intermediate grain size
+  t_siltstone = np.where(mountain_mask, 5.0, 15.0) * silt_env
+  top_siltstone = top_mudstone - t_siltstone
+  
+  # Dolomite: carbonate platform
+  t_dolomite = np.where(mountain_mask, 3.0, 12.0) * lime_env * 0.3
+  top_dolomite = top_siltstone - t_dolomite
+  
+  # Evaporite: restricted basins
+  t_evaporite = np.where(mountain_mask, 1.0, 8.0) * basins * 0.2
+  top_evaporite = top_dolomite - t_evaporite
+  
+  # Ensure all intermediate layers are below surface and properly ordered
+  top_conglomerate = np.minimum(top_conglomerate, E - eps)
+  top_mudstone = np.minimum(top_mudstone, top_conglomerate - eps)
+  top_siltstone = np.minimum(top_siltstone, top_mudstone - eps)
+  top_dolomite = np.minimum(top_dolomite, top_siltstone - eps)
+  top_evaporite = np.minimum(top_evaporite, top_dolomite - eps)
 
-    # ---------- 5b) Crystalline basement partition (Midcontinent style) ----------
+  # ---------- 5b) CRYSTALLINE BASEMENT PARTITION WITH MOUNTAIN VARIETY ----------
   # Total crystalline column between the evaporites and the top of generic Basement
   basement_total = np.maximum(top_evaporite - top_basement, 5.0)
 
-  # Use elevation, slope, and basins to decide how much Granite / Gneiss / Basalt / AncientCrust
-  f_granite, f_gneiss, f_basalt, f_ancient = basement_fractions_midcontinent(
+  # ========== MOUNTAIN LITHOLOGY: Expose Igneous/Metamorphic Rocks ==========
+  # In mountains: more granite, gneiss, schist exposed
+  # In lowlands: standard basement composition
+  
+  # Mountain rock type factors
+  # High, steep mountains → more igneous (granite, diorite)
+  # Moderate mountains → metamorphic (gneiss, schist, slate)
+  mountain_igneous_pref = np.clip((E_norm - 0.6) * (slope_n - 0.4) * 3.0, 0.0, 1.0)
+  mountain_metamorphic_pref = np.clip(E_norm * slope_n * 2.0, 0.0, 1.0)
+  
+  # Base fractions from midcontinent function
+  f_granite_base, f_gneiss_base, f_basalt_base, f_ancient_base = basement_fractions_midcontinent(
       z_norm,   # normalized elevation (0..1)
       slope_n,  # present-day slope (0..1)
       basins,   # 0 on highs, 1 in deep basins
       rng
   )
+  
+  # Adjust fractions in mountains to expose more igneous/metamorphic
+  # Mountains: more granite and gneiss, less basalt
+  f_granite = np.where(
+      mountain_mask,
+      f_granite_base * (1.0 + mountain_igneous_pref * 0.5),  # More granite in mountains
+      f_granite_base
+  )
+  f_gneiss = np.where(
+      mountain_mask,
+      f_gneiss_base * (1.0 + mountain_metamorphic_pref * 0.6),  # More gneiss in mountains
+      f_gneiss_base
+  )
+  f_basalt = np.where(
+      mountain_mask,
+      f_basalt_base * 0.3,  # Less basalt in mountains
+      f_basalt_base
+  )
+  f_ancient = np.where(
+      mountain_mask,
+      f_ancient_base * 0.8,  # Slightly less ancient crust in mountains
+      f_ancient_base
+  )
+  
+  # Normalize fractions to sum to reasonable total
+  total_frac = f_granite + f_gneiss + f_basalt + f_ancient
+  scale = 0.85 / (total_frac + 1e-9)  # Target 85% of basement
+  f_granite *= scale
+  f_gneiss *= scale
+  f_basalt *= scale
+  f_ancient *= scale
 
   # Convert fractions into actual thicknesses (m)
   t_granite = basement_total * f_granite
@@ -1177,24 +1327,58 @@ def generate_stratigraphy(
   top_gneiss         = top_granite  - t_gneiss
   top_basalt         = top_gneiss   - t_basalt
   top_ancient_crust  = top_basalt   - t_ancient
+  
+  # Ensure all basement layers are below surface and properly ordered
+  top_granite = np.minimum(top_granite, E - eps)
+  top_gneiss = np.minimum(top_gneiss, top_granite - eps)
+  top_basalt = np.minimum(top_basalt, top_gneiss - eps)
+  top_ancient_crust = np.minimum(top_ancient_crust, top_basalt - eps)
 
 
   # ---------- 6) Basement floor ----------
   z_floor = float(top_basement.min() - 0.2 * elev_span)
   top_basement_floor = np.full_like(top_basement, z_floor)
 
-  # ---------- 7) Optional smoothing of rock interfaces ----------
+  # ---------- 7) FINAL CONSTRAINT: Ensure ALL layers below surface ----------
+  # CRITICAL: No layer can appear above the surface elevation E
+  # This is a fundamental geological constraint
+  
+  # Constrain all interfaces to be below surface
+  top_topsoil = np.minimum(top_topsoil, E)
+  top_subsoil = np.minimum(top_subsoil, E - eps)
+  top_colluvium = np.minimum(top_colluvium, E - eps)
+  top_saprolite = np.minimum(top_saprolite, E - eps)
+  top_rind = np.minimum(top_rind, E - eps)
+  top_sand = np.minimum(top_sand, E - eps)
+  top_silt = np.minimum(top_silt, E - eps)
+  top_clay = np.minimum(top_clay, E - eps)
+  top_gravel = np.minimum(top_gravel, E - eps)
+  top_sandstone = np.minimum(top_sandstone, E - eps)
+  top_conglomerate = np.minimum(top_conglomerate, E - eps)
+  top_shale = np.minimum(top_shale, E - eps)
+  top_mudstone = np.minimum(top_mudstone, E - eps)
+  top_siltstone = np.minimum(top_siltstone, E - eps)
+  top_limestone = np.minimum(top_limestone, E - eps)
+  top_dolomite = np.minimum(top_dolomite, E - eps)
+  top_evaporite = np.minimum(top_evaporite, E - eps)
+  top_granite = np.minimum(top_granite, E - eps)
+  top_gneiss = np.minimum(top_gneiss, E - eps)
+  top_basalt = np.minimum(top_basalt, E - eps)
+  top_ancient_crust = np.minimum(top_ancient_crust, E - eps)
+  top_basement = np.minimum(top_basement, E - eps)
+
+  # ---------- 7b) Optional smoothing of rock interfaces ----------
   if interface_blur_sigma is not None and interface_blur_sigma > 0:
       def blur(a): return gaussian_blur(a, sigma=interface_blur_sigma)
       top_sandstone = blur(top_sandstone)
       top_shale     = blur(top_shale)
       top_limestone = blur(top_limestone)
       top_basement  = blur(top_basement)
-      # Re-enforce ordering after blur
-      top_sandstone = np.minimum(top_sandstone, top_rind - eps)
-      top_shale     = np.minimum(top_shale,     top_sandstone - eps)
-      top_limestone = np.minimum(top_limestone, top_shale - eps)
-      top_basement  = np.minimum(top_basement,  top_limestone - eps)
+      # Re-enforce ordering AND surface constraint after blur
+      top_sandstone = np.minimum(top_sandstone, np.minimum(top_rind - eps, E - eps))
+      top_shale     = np.minimum(top_shale,     np.minimum(top_sandstone - eps, E - eps))
+      top_limestone = np.minimum(top_limestone, np.minimum(top_shale - eps, E - eps))
+      top_basement  = np.minimum(top_basement,  np.minimum(top_limestone - eps, E - eps))
       z_floor = float(top_basement.min() - 0.2 * elev_span)
       top_basement_floor = np.full_like(top_basement, z_floor)
 
@@ -1213,7 +1397,7 @@ def generate_stratigraphy(
       "Subsoil":       np.maximum(top_subsoil     - top_colluvium,       0.0),
       "Colluvium":     np.maximum(top_colluvium   - top_saprolite,       0.0),
       "Saprolite":     np.maximum(top_saprolite   - top_rind,            0.0),
-      "WeatheredBR":   np.maximum(top_rind        - np.maximum(top_sand, top_clay), 0.0),
+      "WeatheredBR":   np.maximum(top_rind        - top_valley_fill_bottom, 0.0),
 
       # Valley-fill unconsolidated sediments (order depends on environment)
       # Sand: thickness depends on whether it's above or below clay/silt
@@ -1526,6 +1710,8 @@ def generate_stratigraphy(
       "clay_env":     clay_env,   # Clay depositional environment (0-1)
       "gravel_env":   gravel_env, # Gravel depositional environment (0-1)
       "silt_env":     silt_env,   # Silt depositional environment (0-1)
+      "mountain_mask": mountain_mask.astype(float),  # 1 in mountains, 0 elsewhere
+      "lowland_mask": lowland_mask.astype(float),    # 1 in lowlands, 0 elsewhere
   }
 
 
