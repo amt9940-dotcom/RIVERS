@@ -940,29 +940,47 @@ def generate_colluvium_layer(E_norm, slope_class, laplacian, rng, max_thickness=
     - Thickness increases with: slope length, hollow convergence
     - Absent on: ridges, steep bedrock slopes
     
+    CRITICAL FIX: Much thicker in valleys/hollows (concave + low slope)
+    Real behavior: Valley bottoms can have 50-100m+ of colluvium
+    
     Reference: Selby (1993) "Hillslope Materials and Processes"
     """
     # Colluvium accumulates in topographic hollows (concave areas)
     hollows = laplacian > 0
     hollow_strength = _normalize(np.maximum(laplacian, 0.0))
     
-    # Favors mid-slopes (not ridgetops, not valley floors)
-    mid_slope = (E_norm > 0.30) & (E_norm < 0.80)
+    # STRONG preference for low-elevation areas (valleys, not ridges)
+    valley_low = E_norm < 0.5  # Lower half of terrain
     
-    # Gentle to moderate slopes (too flat = no transport, too steep = no accumulation)
+    # Gentle to moderate slopes (too flat = fluvial takes over, too steep = bypass zone)
     good_slope = slope_class["gentle"] | slope_class["moderate"]
     
-    colluvium_favor = hollow_strength * mid_slope.astype(float) * good_slope.astype(float)
+    # Colluvium favor = concavity × low elevation × appropriate slope
+    colluvium_favor = (
+        hollow_strength * 
+        valley_low.astype(float) * 
+        good_slope.astype(float)
+    )
+    
+    # ALSO favor very flat valley floors (thick fill)
+    very_flat_valley = (slope_class["flat"]) & (E_norm < 0.4)
+    colluvium_favor += 0.8 * very_flat_valley.astype(float)
     
     # Smooth to represent downslope creep patterns
     colluvium_favor = _box_blur(colluvium_favor, k=7)
     colluvium_favor = _normalize(colluvium_favor)
     
-    # Add noise
-    noise = rng.lognormal(mean=0.0, sigma=0.25, size=E_norm.shape)
+    # Add noise (but less than before - we want strong signal)
+    noise = rng.lognormal(mean=0.0, sigma=0.15, size=E_norm.shape)
     colluvium_favor_noisy = _normalize(colluvium_favor * noise)
     
+    # Allow much thicker accumulations in optimal sites
     thickness = max_thickness * colluvium_favor_noisy
+    
+    # BOOST thickness in the best spots (concave valleys)
+    best_spots = (hollow_strength > 0.6) & (E_norm < 0.4) & good_slope
+    thickness = np.where(best_spots, thickness * 2.0, thickness)
+    
     return np.maximum(thickness, 0.0)
 
 
@@ -976,23 +994,33 @@ def generate_saprolite_layer(E_norm, slope_class, rng, median_m=6.0, clamp=(0.5,
     - Thickest on: stable, gently sloping interfluves (old surfaces)
     - Thin/absent on: steep slopes (erosion > weathering), valley floors (young surfaces)
     
+    CRITICAL FIX: Use EXPONENTIAL decay with slope (not linear)
+    Real behavior: Very steep slopes have almost no saprolite (bare rock)
+    
     Reference: Buss et al. (2017) "Ancient saprolites reveal sustained tropical deep weathering"
     """
+    # EXPONENTIAL thickness decay with slope
+    # k_slope controls how fast thickness drops with slope
+    # Higher k_slope = more aggressive thinning on slopes
+    k_slope = 8.0  # Decay constant
+    slope_factor = np.exp(-k_slope * slope_class["erosion_factor"])
+    
     # Favor gentle slopes on mid-high elevations (stable interfluves)
     interfluve = (E_norm > 0.40) & (E_norm < 0.85) & slope_class["gentle"]
     
     saprolite_favor = interfluve.astype(float)
     saprolite_favor += 0.5 * ((E_norm > 0.35) & (E_norm < 0.90)).astype(float)
     
-    # Suppress on steep slopes and valley bottoms
-    saprolite_favor *= (1.0 - slope_class["erosion_factor"])
+    # Suppress on valley bottoms (young surfaces)
     saprolite_favor *= np.clip(1.0 - (E_norm < 0.25).astype(float), 0.3, 1.0)
     
     saprolite_favor = _normalize(saprolite_favor)
     
     # Lognormal distribution (some areas have very deep weathering)
     base = np.exp(np.log(median_m) + 0.35 * rng.standard_normal(size=E_norm.shape))
-    thickness = base * (0.4 + 0.6 * saprolite_favor)
+    
+    # CRITICAL: Multiply by exponential slope factor (not linear)
+    thickness = base * saprolite_favor * slope_factor
     
     return np.clip(thickness, clamp[0], clamp[1])
 
@@ -1190,36 +1218,76 @@ def generate_stratigraphy(
   margin = (basins > 0.15) & (basins <= 0.3)    # Margins (sandstone input)
   high = basins <= 0.15          # Structural highs
   
-  # Sandstone environment: Favor basin MARGINS and MID-BASIN (not deep center, not highs)
-  # But will be suppressed by current elevation/slope factors later
-  sand_env = (
+  # ========== CRITICAL: DETECT VALLEYS AND SLOPE ZONES ==========
+  # Problem: Previous version didn't distinguish valleys (mud) from ridges (coarse)
+  # Solution: Detect valleys using slope + curvature, apply facies rules
+  
+  # Valley detection: low slope + low elevation + concave curvature
+  valley_slope = slope_norm < 0.2  # Gentle slopes
+  valley_elev = z_norm < 0.4       # Low elevation
+  valley_curv = laplacian > 0      # Concave (hollows)
+  valley = valley_slope & valley_elev  # Simple: low + gentle
+  valley_strong = valley & valley_curv  # Strong: low + gentle + concave
+  
+  # Slope zones for sandstone/conglomerate control
+  # Real rule: Steep = erosion (no deposition), Moderate = fans (conglomerate), Gentle = channels (sandstone)
+  slope_steep = slope_norm > 0.5      # Steep: erosion zone
+  slope_moderate = (slope_norm > 0.2) & (slope_norm <= 0.5)  # Moderate: alluvial fans
+  slope_gentle = slope_norm <= 0.2    # Gentle: fluvial/deltaic
+  
+  # Ridge detection: high elevation + convex
+  ridge = (z_norm > 0.6) & (laplacian < 0)
+  
+  # ========== FACIES ENVIRONMENTS WITH SLOPE/VALLEY CONTROL ==========
+  
+  # Sandstone environment: REDUCED in valleys, ELIMINATED on steep slopes
+  sand_env_base = (
       0.4 * deep_basin.astype(float) +      # Some in deep center (turbidites)
       1.0 * mid_basin.astype(float) +       # Maximum in mid-basin (deltaic)
       0.8 * margin.astype(float) +          # High at margins (fluvial input)
       0.1 * high.astype(float)              # Minimal on structural highs
   )
+  
+  # CRITICAL MODIFICATIONS:
+  # 1. Valleys: reduce sandstone (0.5x)
+  # 2. Moderate slopes: boost sandstone (fan channels)
+  # 3. Steep slopes: eliminate sandstone (erosion zone)
+  sand_env = sand_env_base.copy()
+  sand_env = np.where(valley, sand_env * 0.5, sand_env)  # Reduce in valleys
+  sand_env = np.where(slope_moderate, sand_env * 1.3, sand_env)  # Boost on moderate slopes
+  sand_env = np.where(slope_steep, sand_env * 0.1, sand_env)  # Eliminate on steep slopes
+  
   sand_env = _normalize(sand_env)
   sand_env = _box_blur(sand_env, k=max(15, int(0.08 * N) | 1))  # Smooth transitions
   
-  # Shale environment: Strongest in DEEP BASINS (low energy)
-  # Moderate elsewhere
-  shale_env = (
+  # Shale environment: BOOSTED in valleys (3x), in deep basins
+  shale_env_base = (
       1.0 * deep_basin.astype(float) +      # Maximum in deep center
       0.8 * mid_basin.astype(float) +       # High in mid-basin
       0.5 * margin.astype(float) +          # Lower at margins (more energy)
       0.1 * high.astype(float)              # Minimal on highs
   )
+  
+  # CRITICAL: Valleys are MUD-DOMINATED (3x shale)
+  shale_env = shale_env_base.copy()
+  shale_env = np.where(valley, shale_env * 3.0, shale_env)  # TRIPLE in valleys
+  shale_env = np.where(ridge, shale_env * 0.3, shale_env)  # Reduce on ridges
+  
   shale_env = _normalize(shale_env)
   shale_env = _box_blur(shale_env, k=max(15, int(0.08 * N) | 1))
   
-  # Limestone environment: Strongest in MID-BASIN (carbonate platforms)
-  # Weak in deep center (below CCD) and margins (clastic dilution)
-  lime_env = (
+  # Limestone environment: Strongest in MID-BASIN, REDUCED in valleys (clastic input)
+  lime_env_base = (
       0.3 * deep_basin.astype(float) +      # Weak in very deep water
       1.0 * mid_basin.astype(float) +       # Strong on platforms
       0.4 * margin.astype(float) +          # Weak at margins (clastic input)
       0.1 * high.astype(float)              # Minimal on highs
   )
+  
+  # Valleys have clastic dilution (reduce carbonates)
+  lime_env = lime_env_base.copy()
+  lime_env = np.where(valley, lime_env * 0.5, lime_env)  # Reduce in valleys (clastic dilution)
+  
   lime_env = _normalize(lime_env)
   lime_env = _box_blur(lime_env, k=max(15, int(0.08 * N) | 1))
 
@@ -1340,8 +1408,18 @@ def generate_stratigraphy(
   t_shale_rock = t_shale_trend * thin_factor
   t_lime_rock  = t_lime_trend  * thin_factor
   
-  # Add other sedimentary rock types (proportional to main facies) + APPLY MASKS
-  t_conglomerate = (base_sand * 0.3) * thin_factor * conglom_present_mask.astype(float)
+  # ========== CONGLOMERATE: STRONGLY TIED TO MODERATE SLOPES (ALLUVIAL FANS) ==========
+  # Real rule: Conglomerate forms at mountain fronts, alluvial fans (moderate slopes near highs)
+  # NOT in valleys (too low energy), NOT on steep slopes (bypass zone)
+  
+  conglom_base = (base_sand * 0.3) * thin_factor
+  
+  # BOOST conglomerate on moderate slopes (2x), REDUCE in valleys (0.2x)
+  conglom_boost = np.where(slope_moderate, conglom_base * 2.0, conglom_base)
+  conglom_boost = np.where(valley, conglom_boost * 0.2, conglom_boost)
+  conglom_boost = np.where(slope_steep, conglom_boost * 0.5, conglom_boost)  # Some on very steep (debris flows)
+  
+  t_conglomerate = conglom_boost * conglom_present_mask.astype(float)
   t_mudstone     = (base_shale * 0.35) * thin_factor * shale_present_mask.astype(float)
   t_siltstone    = (base_shale * 0.25) * thin_factor * shale_present_mask.astype(float)
   t_dolomite     = (base_lime * 0.20) * thin_factor * limestone_present_mask.astype(float)
@@ -1361,31 +1439,48 @@ def generate_stratigraphy(
   t_dolomite = _box_blur(t_dolomite, k=k_final_smooth)
   t_evaporite = _box_blur(t_evaporite, k=k_final_smooth)
 
-  # ---------- 4) Structural tops for sedimentary rocks ----------
-  # With thickness controlled by basins (above), the basement will naturally end up:
-  # - DEEP under basins (thick sediments push it down)
-  # - SHALLOW under highs (thin sediments)
-  Emean       = float(E.mean())
-  crust_mean  = float(crust_thick.mean())
-  crust_anom  = (crust_thick - crust_mean) / (crust_mean + 1e-9)
+  # ========== CRITICAL: BASEMENT AS INDEPENDENT STRUCTURAL SURFACE ==========
+  # Problem: Previous version tied basement to current elevation (Emean - burial_depth_m)
+  # Solution: Generate basement from tectonic structure ONLY (independent of current surface)
+  #
+  # Real geology: Basement is old structural surface
+  #               Current topography is YOUNG (cut by erosion)
+  #               They should be mostly independent!
   
-  top_sed_ref_raw = (
-      (Emean - burial_depth_m)
-      - 0.3 * crust_anom * elev_span
-      + bed_struct_weight * bed_struct_zm
-  )
-  # Smooth the structural reference surface (eliminates high-frequency jitter in all layers)
-  top_sed_ref = _box_blur(top_sed_ref_raw, k=max(31, int(0.15 * N) | 1))
-
-  top_sandstone_raw = top_sed_ref
-  top_conglomerate_raw = top_sandstone_raw - t_sand_rock
-  top_shale_raw     = top_conglomerate_raw - t_conglomerate
-  top_mudstone_raw = top_shale_raw - t_shale_rock
-  top_siltstone_raw = top_mudstone_raw - t_mudstone
-  top_limestone_raw = top_siltstone_raw - t_siltstone
-  top_dolomite_raw = top_limestone_raw - t_lime_rock
-  top_evaporite_raw = top_dolomite_raw - t_dolomite
-  top_basement_raw  = top_evaporite_raw - t_evaporite  # DEEP under basins!
+  # Define basement elevation from:
+  # 1. Regional dip (tectonic)
+  # 2. Basin subsidence (structural lows)
+  # 3. NO dependence on current surface elevation
+  
+  # Set basement datum (reference level, arbitrary but consistent)
+  basement_datum = -500.0  # meters (below mean surface)
+  
+  # Basement follows structural basin field (low where basins are deep)
+  # This creates the "basin geometry" independently of current topography
+  basement_subsidence = basins * 600.0  # 0-600m of subsidence in deepest basins
+  
+  # Add regional dip to basement (tectonic tilting)
+  # Already have plane from bed_struct
+  basement_regional_dip = plane * 0.3  # Gentle regional tilt
+  
+  # Basement elevation = datum - subsidence + regional dip
+  top_basement_structural = basement_datum - basement_subsidence + basement_regional_dip
+  
+  # Smooth basement surface (tectonic features are long-wavelength)
+  top_basement_structural = _box_blur(top_basement_structural, k=max(63, int(0.3 * N) | 1))
+  
+  # ========== BUILD SEDIMENTARY STACK UPWARD FROM BASEMENT ==========
+  # Now build layers UPWARD from independent basement, not DOWNWARD from surface
+  
+  top_basement_raw = top_basement_structural
+  top_evaporite_raw = top_basement_raw + t_evaporite
+  top_dolomite_raw = top_evaporite_raw + t_dolomite
+  top_limestone_raw = top_dolomite_raw + t_lime_rock
+  top_siltstone_raw = top_limestone_raw + t_siltstone
+  top_mudstone_raw = top_siltstone_raw + t_mudstone
+  top_shale_raw = top_mudstone_raw + t_shale_rock
+  top_conglomerate_raw = top_shale_raw + t_conglomerate
+  top_sandstone_raw = top_conglomerate_raw + t_sand_rock
 
     # ---------- 5) Regolith stack above rock ----------
   eps = 0.01
