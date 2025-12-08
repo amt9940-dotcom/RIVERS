@@ -1016,224 +1016,569 @@ def generate_weathered_bedrock_rind(E_norm, rng, median_m=1.8, clamp=(0.4, 6.0))
     return np.clip(thickness, clamp[0], clamp[1])
 
 
-def enforce_stratigraphic_order(layers_dict, E):
-    """
-    Enforce Walther's Law and stratigraphic superposition.
-    
-    STRATIGRAPHIC PRINCIPLES:
-    1. Law of Superposition: Older (deeper) layers below younger (shallower) layers
-    2. Walther's Law: Vertical succession mirrors lateral facies changes
-    3. No floating layers: Each layer must rest on the layer below
-    
-    Expected vertical sequence (top to bottom):
-    Topsoil → Subsoil → [Alluvium/Clay/Silt/Sand] → Colluvium → Saprolite → 
-    Weathered Bedrock → [Sandstone/Shale/Limestone] → Basement
-    
-    Reference: Boggs (2011) Ch. 2 - Sedimentary Structures
-    """
-    ny, nx = E.shape
-    eps = 0.01  # Small gap between layers
-    
-    # Define top surfaces starting from ground surface
-    top = {}
-    top["surface"] = E.copy()
-    
-    # Layer order (top to bottom) - REALISTIC STRATIGRAPHY
-    sequence = [
-        "Topsoil",
-        "Subsoil", 
-        "Clay",        # Fine sediments in valleys
-        "Silt",        # Intermediate sediments  
-        "Sand",        # Coarse sediments in channels
-        "Colluvium",   # Hillslope deposits
-        "Saprolite",   # Deep weathering
-        "WeatheredBR", # Weathered bedrock rind
-        "Sandstone",   # Consolidated sedimentary rock
-        "Shale",       # Fine-grained sedimentary rock
-        "Limestone",   # Carbonate rock
-        "Basement",    # Crystalline basement
-    ]
-    
-    current_top = E.copy()
-    ordered_thickness = {}
-    
-    for layer in sequence:
-        if layer in layers_dict:
-            t = layers_dict[layer]
-            bottom = current_top - t
-            
-            # Ensure non-negative thickness
-            ordered_thickness[layer] = np.maximum(current_top - bottom, 0.0)
-            top[layer] = current_top.copy()
-            
-            # Update for next layer
-            current_top = bottom - eps
-    
-    return ordered_thickness, top
 
 
 def generate_stratigraphy(
-    z_norm, rng,
-    elev_range_m=700.0,
-    pixel_scale_m=10.0,
-    **kwargs  # Accept but ignore old parameters for backward compatibility
+  z_norm, rng,
+  elev_range_m=700.0,
+  pixel_scale_m=10.0,
+  soil_range_m=(0.3, 1.8),
+  # Colluvium controls
+  colluvium_max_m=18.0,
+  wC_gentle=0.35, wC_curv=0.30, wC_low=0.20, wC_twi=0.15,
+  C_relief_px=31, C_twi_k1=7, C_twi_k2=13, C_sigma=0.20, C_floor=0.5, C_bias=1.0,
+  # Saprolite controls
+  sap_median=6.0, sap_min=0.5, sap_max=30.0, sap_w_gentle=0.6, sap_w_inter=0.4, sap_relief_px=61, sap_sigma=0.35,
+  # Weathered rind controls
+  rind_median=1.8, rind_min=0.4, rind_max=6.0, rind_patch_beta=3.0, rind_patch_alpha=0.5,
+  # Competent rock package (relative proportions)
+  unit_thickness_m=(90.0,110.0,100.0),  # sandstone, shale, limestone
+  undulation_amp_m=10.0, undulation_beta=3.2,
+  dip_deg=6.0, dip_dir_deg=45.0,
+  burial_depth_m=120.0,
+  bed_struct_weight=0.45,
+  interface_blur_sigma=None
 ):
-    """
-    ✅ IMPROVED GEOLOGICAL LAYER GENERATOR
-    
-    Generates realistic stratigraphic layers using:
-    - Elevation zones (lowlands, midlands, highlands)
-    - Slope regimes (flat, gentle, moderate, steep)
-    - Depositional environments (lacustrine, fluvial, colluvial, aeolian, residual)
-    - Stratigraphic ordering (Walther's Law)
-    
-    INPUT (from topography generator - DO NOT MODIFY):
-    - z_norm: Normalized elevation (0-1) from quantum_seeded_topography()
-    - rng: Random number generator
-    - elev_range_m: Total elevation range (m)
-    - pixel_scale_m: Grid resolution (m/pixel)
-    
-    OUTPUT:
-    - Thickness maps for each geological layer
-    - Interface elevations (top of each layer)
-    - Material properties
-    - Metadata
-    
-    SCIENTIFIC REFERENCES:
-    - Boggs (2011) "Principles of Sedimentology and Stratigraphy" 7th ed.
-    - USGS Professional Paper 1396 "Sediment Transport"
-    - Dunne & Leopold (1978) "Water in Environmental Planning"
-    - USDA Soil Survey Manual
-    """
-    N = z_norm.shape[0]
-    
-    # Convert normalized elevation to absolute elevation (m)
-    E = z_norm * elev_range_m
-    E_norm = z_norm  # Keep normalized for classification
-    
-    # ========== STEP 1: COMPUTE TOPOGRAPHIC DERIVATIVES ==========
-    dEy, dEx = np.gradient(E, pixel_scale_m, pixel_scale_m)
-    slope_mag = np.hypot(dEx, dEy) + 1e-12  # m/m
-    slope_deg = np.rad2deg(np.arctan(slope_mag))  # Convert to degrees
-    slope_norm = _normalize(slope_mag)
-    
-    # Laplacian for curvature
-    d2x, _ = np.gradient(dEx)
-    _, d2y = np.gradient(dEy)
-    laplacian = d2x + d2y
-    
-    # ========== STEP 2: CLASSIFY TERRAIN ==========
-    elev_zones = classify_elevation_zones(E_norm)
-    slope_regimes = classify_slope_regimes(slope_deg)
-    
-    # Identify depositional environments
-    environments = compute_depositional_environments(E_norm, slope_norm, laplacian, rng)
-    
-    # ========== STEP 3: GENERATE UNCONSOLIDATED LAYERS ==========
-    # (Based on current surface conditions - elevation + slope + environment)
-    
-    # TOPSOIL (O/A horizon) - universal, but thickness varies with slope
-    t_topsoil_total = generate_topsoil_layer(E_norm, slope_regimes, rng, base_thickness=(0.3, 1.8))
-    t_topsoil = 0.40 * t_topsoil_total  # A horizon
-    t_subsoil = 0.60 * t_topsoil_total  # B horizon
-    
-    # FINE SEDIMENTS - low-energy environments
-    t_clay = generate_clay_layer(environments, slope_regimes, E_norm, rng, max_thickness=20.0)
-    t_silt = generate_silt_layer(environments, slope_regimes, E_norm, rng, max_thickness=15.0)
-    
-    # COARSE SEDIMENTS - moderate-high energy environments
-    t_sand = generate_sand_layer(environments, slope_regimes, E_norm, rng, max_thickness=25.0)
-    t_gravel = generate_gravel_layer(environments, slope_regimes, E_norm, rng, max_thickness=12.0)
-    
-    # HILLSLOPE DEPOSITS
-    t_colluvium = generate_colluvium_layer(E_norm, slope_regimes, laplacian, rng, max_thickness=18.0)
-    
-    # WEATHERING PROFILE
-    t_saprolite = generate_saprolite_layer(E_norm, slope_regimes, rng, median_m=6.0, clamp=(0.5, 30.0))
-    t_weathered_br = generate_weathered_bedrock_rind(E_norm, rng, median_m=1.8, clamp=(0.4, 6.0))
-    
-    # ========== STEP 4: GENERATE BEDROCK LAYERS ==========
-    # (Deeper stratigraphy - less dependent on current topography)
-    
-    # Simplified bedrock structure for now (can be enhanced later)
-    # Use coarse elevation/slope patterns for broad structural trends
-    k_coarse = max(31, int(0.15 * N) | 1)
-    z_smooth = _box_blur(z_norm, k=k_coarse)
-    basins = _normalize(1.0 - z_smooth)
-    
-    # Sedimentary package thickness (thicker in basins)
-    t_sandstone = 60.0 + 40.0 * basins
-    t_shale = 80.0 + 30.0 * basins  
-    t_limestone = 70.0 + 30.0 * basins
-    
-    # Basement (crystalline bedrock)
-    basement_thickness = 200.0 + 100.0 * z_norm  # Thicker under mountains (isostasy)
-    
-    # ========== STEP 5: ENFORCE STRATIGRAPHIC ORDER ==========
-    raw_layers = {
-        "Topsoil": t_topsoil,
-        "Subsoil": t_subsoil,
-        "Clay": t_clay,
-        "Silt": t_silt, 
-        "Sand": t_sand,
-        "Colluvium": t_colluvium,
-        "Saprolite": t_saprolite,
-        "WeatheredBR": t_weathered_br,
-        "Sandstone": t_sandstone,
-        "Shale": t_shale,
-        "Limestone": t_limestone,
-        "Basement": basement_thickness,
-    }
-    
-    thickness, interfaces = enforce_stratigraphic_order(raw_layers, E)
-    
-    # Add basement floor
-    z_floor = float(interfaces[list(interfaces.keys())[-1]].min() - 50.0)
-    interfaces["BasementFloor"] = np.full_like(E, z_floor)
-    thickness["BasementFloor"] = 50.0 * np.ones_like(E)
-    
-    # ========== STEP 6: MATERIAL PROPERTIES ==========
-    properties = {
-        "Topsoil": {"erodibility": 1.00, "density": 1600, "porosity": 0.45, "K_rel": 1.00},
-        "Subsoil": {"erodibility": 0.85, "density": 1700, "porosity": 0.40, "K_rel": 0.85},
-        "Clay": {"erodibility": 0.80, "density": 1850, "porosity": 0.45, "K_rel": 0.80},
-        "Silt": {"erodibility": 0.90, "density": 1750, "porosity": 0.42, "K_rel": 0.90},
-        "Sand": {"erodibility": 0.85, "density": 1700, "porosity": 0.35, "K_rel": 0.85},
-        "Colluvium": {"erodibility": 0.90, "density": 1750, "porosity": 0.35, "K_rel": 0.90},
-        "Saprolite": {"erodibility": 0.70, "density": 1900, "porosity": 0.30, "K_rel": 0.70},
-        "WeatheredBR": {"erodibility": 0.55, "density": 2100, "porosity": 0.20, "K_rel": 0.55},
-        "Sandstone": {"erodibility": 0.30, "density": 2200, "porosity": 0.18, "K_rel": 0.30},
-        "Shale": {"erodibility": 0.45, "density": 2300, "porosity": 0.12, "K_rel": 0.45},
-        "Limestone": {"erodibility": 0.28, "density": 2400, "porosity": 0.08, "K_rel": 0.28},
-        "Basement": {"erodibility": 0.15, "density": 2700, "porosity": 0.01, "K_rel": 0.15},
-        "BasementFloor": {"erodibility": 0.02, "density": 2850, "porosity": 0.005, "K_rel": 0.02},
-    }
-    
-    # ========== STEP 7: COMPUTE ALLUVIUM (Active channels) ==========
-    # Separate from main stratigraphy - represents modern/active deposits
-    catch = _box_blur(_box_blur(1.0 - slope_norm, k=7), k=13)
-    wet = _normalize(catch - slope_norm)
-    alluvium = np.where(wet > 0.7, np.minimum(2.0 * rng.random(size=wet.shape), 2.0), 0.0)
-    
-    deposits = {"Alluvium": alluvium}
-    
-    # ========== OUTPUT ==========
-    return {
-        "surface_elev": E,
-        "interfaces": interfaces,
-        "thickness": thickness,
-        "properties": properties,
-        "deposits": deposits,
-        "meta": {
-            "elev_range_m": elev_range_m,
-            "pixel_scale_m": pixel_scale_m,
-            "z_floor": z_floor,
-            # Store diagnostic info
-            "elevation_zones": elev_zones,
-            "slope_regimes": slope_regimes,
-            "environments": environments,
-        }
-    }
+  """
+  Build stratigraphy where:
+  - Topsoil / Colluvium / Saprolite / WeatheredBR follow hillslope & weathering rules.
+  - CRITICAL FIX: Sedimentary layers (Sandstone / Shale / Limestone) now THICKEN in basins, THIN on highs
+  - Basement is DEEP under basins, SHALLOW under mountains (isostatic balance)
+  - All original layers restored with proper basin-responsive behavior
+  """
+  N = z_norm.shape[0]
+  # Absolute elevation (m)
+  E = z_norm * elev_range_m
+
+  # ========== STEP 1: COMPUTE TOPOGRAPHIC DERIVATIVES ==========
+  dEy, dEx = np.gradient(E, pixel_scale_m, pixel_scale_m)
+  slope_mag = np.hypot(dEx, dEy) + 1e-12
+  slope_deg = np.rad2deg(np.arctan(slope_mag))
+  slope_norm = _normalize(slope_mag)
+  
+  # Laplacian for curvature
+  d2x, _ = np.gradient(dEx)
+  _, d2y = np.gradient(dEy)
+  laplacian = d2x + d2y
+  
+  # ========== STEP 2: CLASSIFY TERRAIN (for unconsolidated sediments) ==========
+  elev_zones = classify_elevation_zones(z_norm)
+  slope_regimes = classify_slope_regimes(slope_deg)
+  environments = compute_depositional_environments(z_norm, slope_norm, laplacian, rng)
+
+    # ---------- 1) Near-surface regolith ----------
+  # Total soil thickness: thicker on low, gentle slopes
+  soil_total = generate_topsoil_layer(z_norm, slope_regimes, rng, base_thickness=soil_range_m)
+
+  # Split into Topsoil (A) and Subsoil (B horizon).
+  top_frac = 0.4
+  topsoil_thick  = top_frac * soil_total
+  subsoil_thick  = (1.0 - top_frac) * soil_total
+
+  # Colluvium: gravity-driven, thickest at slope bases/hollows/lowlands.
+  tC = generate_colluvium_layer(z_norm, slope_regimes, laplacian, rng, max_thickness=colluvium_max_m)
+
+  # Saprolite: thick in stable, moderately elevated interfluves.
+  tS = generate_saprolite_layer(z_norm, slope_regimes, rng, median_m=sap_median, clamp=(sap_min, sap_max))
+
+  # Weathered bedrock rind / grus: patchy, overlying basement.
+  tR = generate_weathered_bedrock_rind(z_norm, rng, median_m=rind_median, clamp=(rind_min, rind_max))
+
+  # ========== NEW: Terrain-specific valley-fill sediments ==========
+  # These are MODERN/RECENT deposits in current lowlands only
+  low_elev_factor = np.clip(1.0 - z_norm, 0.0, 1.0)
+  basin_low = (1.0 - _normalize(_box_blur(z_norm, k=max(31, int(0.15 * N) | 1)))) * low_elev_factor
+
+  flat_low      = (1.0 - slope_norm) * basin_low
+  valley_mid    = (1.0 - slope_norm * 0.7) * basin_low
+  valley_coarse = basin_low * slope_norm
+
+  flat_low_n      = _normalize(flat_low)
+  valley_mid_n    = _normalize(valley_mid)
+  valley_coarse_n = _normalize(valley_coarse)
+
+  max_clay_m = 20.0
+  max_silt_m = 15.0
+  max_sand_m = 25.0
+
+  t_clay = max_clay_m * flat_low_n
+  t_silt = max_silt_m * valley_mid_n
+  t_sand = max_sand_m * valley_coarse_n
+
+  # ---------- 2) Structural plane for sedimentary cover ----------
+  # THIS IS THE KEY FIX: Sedimentary units follow structure that VARIES with basin/ridge position
+  ii, jj = np.meshgrid(np.arange(N), np.arange(N), indexing="ij")
+  X = ii * pixel_scale_m
+  Y = jj * pixel_scale_m
+  az  = np.deg2rad(dip_dir_deg)   # map-view azimuth of dip direction
+  dip = np.deg2rad(dip_deg)       # dip angle
+  ux, uy = np.cos(az), np.sin(az) # unit vector along dip direction
+
+  plane = np.tan(dip) * (ux * X + uy * Y)   # regional dip
+  undul = (fractional_surface(N, beta=undulation_beta, rng=rng)*2 - 1) * undulation_amp_m
+  bed_struct = plane + undul
+  bed_struct_zm = bed_struct - np.mean(bed_struct)
+
+
+  # ---------- 3) Continental crust & sedimentary thickness trend ----------
+  # CRITICAL FIX: Use PALEO-topography (smoothed) to determine basin vs ridge
+  elev_span = float(E.max() - E.min() + 1e-9)
+  
+  # Crustal thickness: thicker under high topo (isostatic balance)
+  def crust_thickness_field(surface_elev, elev_range_m, min_factor=2.0, max_factor=5.0):
+      span = max(float(elev_range_m), 1e-3)
+      zmin = float(surface_elev.min())
+      zmax = float(surface_elev.max())
+      znorm = (surface_elev - zmin) / (zmax - zmin + 1e-12)
+      factor = min_factor + (max_factor - min_factor) * znorm
+      return span * factor
+  
+  crust_thick = crust_thickness_field(E, elev_span)
+
+  # Assume ~35% of crust_thick is sedimentary cover
+  sed_frac  = 0.35
+  sed_total = sed_frac * crust_thick
+
+  # Very coarse topographic smooth to define PALEO basins vs highs
+  k_coarse = max(31, int(0.15 * N) | 1)
+  z_smooth = _box_blur(z_norm, k=k_coarse)
+  basins   = _normalize(1.0 - z_smooth)   # 1 in lows, 0 on highs  ← KEY FOR BASIN THICKENING
+  highs    = _normalize(z_smooth)         # 1 on highs
+
+  # Present slope – steeper = more erosion, so thinner preserved cover.
+  gentle    = 1.0 - slope_norm
+
+  # Facies environments (all 0–1 after _normalize):
+  # CRITICAL FIX: ALL sedimentary rocks must thicken in basins (user requirement)
+  sand_env_raw  = basins * (0.8 + 0.2 * gentle)  # Favor basins directly
+  shale_env_raw = basins  # Maximum in deepening basins (offshore muds)
+  lime_env_raw  = basins * (0.7 + 0.3 * gentle)  # Also favor basins (marine sedimentation)
+
+  sand_env  = _normalize(sand_env_raw)
+  shale_env = _normalize(shale_env_raw)
+  lime_env  = _normalize(lime_env_raw)
+
+  # Relative vertical proportions from unit_thickness_m
+  T_sand, T_shale, T_lime = unit_thickness_m
+  total_units = float(T_sand + T_shale + T_lime + 1e-12)
+  f_sand  = T_sand  / total_units
+  f_shale = T_shale / total_units
+  f_lime  = T_lime  / total_units
+
+  # Helper: smoothed random field (quantum-seeded, but laterally coherent)
+  def smooth_random_field(k):
+      noise = rng.standard_normal(size=E.shape)
+      return _box_blur(noise, k=max(5, int(k) | 1))
+
+  k_thick = max(15, int(0.06 * N) | 1)
+
+  # Base thickness fields (trend) for each unit
+  # CRITICAL FIX: Thickness is MAXIMUM in basins, MINIMUM on highs
+  # MULTIPLY by basins factor so thickness increases in basins!
+  basin_thickness_mult = 0.3 + 2.0 * basins  # 0.3x on highs, 2.3x in basins
+  
+  base_sand  = sed_total * f_sand  * (0.4 + 0.6 * sand_env) * basin_thickness_mult
+  base_shale = sed_total * f_shale * (0.3 + 0.7 * shale_env) * basin_thickness_mult
+  base_lime  = sed_total * f_lime  * (0.3 + 0.7 * lime_env) * basin_thickness_mult
+
+  # Quantum-smoothed variability
+  rnd_sand  = smooth_random_field(k_thick)
+  rnd_shale = smooth_random_field(k_thick)
+  rnd_lime  = smooth_random_field(k_thick)
+
+  def apply_variation(base, rnd, amp=0.3):
+      std = float(np.std(rnd) + 1e-9)
+      f = 1.0 + amp * (rnd / std)
+      f = np.clip(f, 0.5, 1.5)
+      return np.clip(base * f, 0.0, None)
+
+  t_sand_trend  = apply_variation(base_sand,  rnd_sand)
+  t_shale_trend = apply_variation(base_shale, rnd_shale)
+  t_lime_trend  = apply_variation(base_lime,  rnd_lime)
+
+  # Thin units modestly on steep slopes, but never turn them off entirely
+  thin_factor = 0.4 + 0.6 * gentle  # 1 on gentle, 0.4 on steep
+  t_sand_rock  = t_sand_trend  * thin_factor
+  t_shale_rock = t_shale_trend * thin_factor
+  t_lime_rock  = t_lime_trend  * thin_factor
+  
+  # Add other sedimentary rock types (also basin-responsive)
+  t_conglomerate = (base_sand * 0.3) * thin_factor * basin_thickness_mult
+  t_mudstone     = (base_shale * 0.35) * thin_factor * basin_thickness_mult
+  t_siltstone    = (base_shale * 0.25) * thin_factor * basin_thickness_mult
+  t_dolomite     = (base_lime * 0.20) * thin_factor * basin_thickness_mult
+  t_evaporite    = (basins * 15.0) * (gentle**2) * basin_thickness_mult  # Maximum in deep basins
+
+  # ---------- 4) Structural tops for sedimentary rocks ----------
+  # With thickness controlled by basins (above), the basement will naturally end up:
+  # - DEEP under basins (thick sediments push it down)
+  # - SHALLOW under highs (thin sediments)
+  Emean       = float(E.mean())
+  crust_mean  = float(crust_thick.mean())
+  crust_anom  = (crust_thick - crust_mean) / (crust_mean + 1e-9)
+  
+  top_sed_ref = (
+      (Emean - burial_depth_m)
+      - 0.3 * crust_anom * elev_span
+      + bed_struct_weight * bed_struct_zm
+  )
+
+  top_sandstone_raw = top_sed_ref
+  top_conglomerate_raw = top_sandstone_raw - t_sand_rock
+  top_shale_raw     = top_conglomerate_raw - t_conglomerate
+  top_mudstone_raw = top_shale_raw - t_shale_rock
+  top_siltstone_raw = top_mudstone_raw - t_mudstone
+  top_limestone_raw = top_siltstone_raw - t_siltstone
+  top_dolomite_raw = top_limestone_raw - t_lime_rock
+  top_evaporite_raw = top_dolomite_raw - t_dolomite
+  top_basement_raw  = top_evaporite_raw - t_evaporite  # DEEP under basins!
+
+    # ---------- 5) Regolith stack above rock ----------
+  eps = 0.01
+
+  # A and B horizons
+  top_topsoil   = E
+  top_subsoil   = top_topsoil   - topsoil_thick
+  top_colluvium = top_subsoil   - subsoil_thick
+
+    # Colluvium, saprolite, weathered rind
+  top_saprolite = top_colluvium - tC
+  top_rind      = top_saprolite - tS
+
+  # Valley-fill sediments (Clay → Silt → Sand)
+  top_clay = top_rind - tR
+  top_silt = top_clay - t_clay
+  top_sand = top_silt - t_silt
+
+  # Ensure rock units stay below valley fill and respect ordering
+  top_sandstone = np.minimum(top_sandstone_raw, top_sand - eps)
+  top_conglomerate = np.minimum(top_conglomerate_raw, top_sandstone - eps)
+  top_shale     = np.minimum(top_shale_raw,     top_conglomerate - eps)
+  top_mudstone = np.minimum(top_mudstone_raw, top_shale - eps)
+  top_siltstone = np.minimum(top_siltstone_raw, top_mudstone - eps)
+  top_limestone = np.minimum(top_limestone_raw, top_siltstone - eps)
+  top_dolomite = np.minimum(top_dolomite_raw, top_limestone - eps)
+  top_evaporite = np.minimum(top_evaporite_raw, top_dolomite - eps)
+
+    # ---------- 5b) Crystalline basement partition (Midcontinent style) ----------
+  # Total crystalline column between evaporites and basement floor
+  basement_total = np.maximum(top_evaporite - top_basement_raw, 5.0)
+
+  # Basement composition fractions
+  def basement_fractions_midcontinent(z_norm, slope_n, basins, rng):
+      E_norm = z_norm
+      relief = slope_n
+      
+      f_granite = 0.35 + 0.10 * (1.0 - basins) - 0.10 * relief
+      f_gneiss  = 0.30 + 0.20 * E_norm + 0.15 * relief
+      f_basalt  = 0.02 + 0.08 * basins - 0.05 * E_norm
+      f_ancient = 0.12 + 0.05 * E_norm
+      
+      noise = rng.standard_normal(size=z_norm.shape)
+      noise = _box_blur(noise, k=11)
+      f_basalt += 0.02 * noise
+      
+      f_basalt = np.clip(f_basalt, 0.01, 0.06)
+      f_granite = np.clip(f_granite, 0.05, None)
+      f_gneiss  = np.clip(f_gneiss, 0.05, None)
+      f_ancient = np.clip(f_ancient, 0.05, None)
+      
+      total = f_granite + f_gneiss + f_basalt + f_ancient
+      total_fraction = 0.85
+      scale = total_fraction / (total + 1e-9)
+      
+      return f_granite * scale, f_gneiss * scale, f_basalt * scale, f_ancient * scale
+  
+  f_granite, f_gneiss, f_basalt, f_ancient = basement_fractions_midcontinent(z_norm, slope_norm, basins, rng)
+
+  # Convert fractions into actual thicknesses (m)
+  t_granite = basement_total * f_granite
+  t_gneiss  = basement_total * f_gneiss
+  t_basalt  = basement_total * f_basalt
+  t_ancient = basement_total * f_ancient
+
+  # Build interfaces top-down from evaporites
+  top_granite        = top_evaporite
+  top_gneiss         = top_granite  - t_granite
+  top_basalt         = top_gneiss   - t_gneiss
+  top_ancient_crust  = top_basalt   - t_basalt
+  top_basement       = top_ancient_crust - t_ancient
+
+
+  # ---------- 6) Basement floor ----------
+  z_floor = float(top_basement.min() - 0.2 * elev_span)
+  top_basement_floor = np.full_like(top_basement, z_floor)
+
+  # ---------- 7) Optional smoothing of rock interfaces ----------
+  if interface_blur_sigma is not None and interface_blur_sigma > 0:
+      def blur(a): return gaussian_blur(a, sigma=interface_blur_sigma)
+      top_sandstone = blur(top_sandstone)
+      top_shale     = blur(top_shale)
+      top_limestone = blur(top_limestone)
+      z_floor = float(top_basement.min() - 0.2 * elev_span)
+      top_basement_floor = np.full_like(top_basement, z_floor)
+
+    # ---------- 8) Thickness rasters ----------
+  thickness = {
+      # Regolith
+      "Topsoil":       np.maximum(top_topsoil     - top_subsoil,         0.0),
+      "Subsoil":       np.maximum(top_subsoil     - top_colluvium,       0.0),
+      "Colluvium":     np.maximum(top_colluvium   - top_saprolite,       0.0),
+      "Saprolite":     np.maximum(top_saprolite   - top_rind,            0.0),
+      "WeatheredBR":   np.maximum(top_rind        - top_clay,            0.0),
+
+      # Valley-fill sediments (modern/recent)
+      "Clay":          np.maximum(top_clay        - top_silt,            0.0),
+      "Silt":          np.maximum(top_silt        - top_sand,            0.0),
+      "Sand":          np.maximum(top_sand        - top_sandstone,       0.0),
+
+      # Sedimentary Units (ancient, basin-responsive)
+      "Sandstone":     np.maximum(top_sandstone     - top_conglomerate,    0.0),
+      "Conglomerate":  np.maximum(top_conglomerate  - top_shale,           0.0),
+      "Shale":         np.maximum(top_shale         - top_mudstone,        0.0),
+      "Mudstone":      np.maximum(top_mudstone      - top_siltstone,       0.0),
+      "Siltstone":     np.maximum(top_siltstone     - top_limestone,       0.0),
+      "Limestone":     np.maximum(top_limestone     - top_dolomite,        0.0),
+      "Dolomite":      np.maximum(top_dolomite      - top_evaporite,       0.0),
+      "Evaporite":     np.maximum(top_evaporite     - top_granite,         0.0),
+
+      # Crystalline Units
+      "Granite":       np.maximum(top_granite     - top_gneiss,          0.0),
+      "Gneiss":        np.maximum(top_gneiss      - top_basalt,          0.0),
+      "Basalt":        np.maximum(top_basalt      - top_ancient_crust,   0.0),
+      "AncientCrust":  np.maximum(top_ancient_crust - top_basement,      0.0),
+
+      # Base
+      "Basement":      np.maximum(top_basement    - top_basement_floor,  0.0),
+      "BasementFloor": np.maximum(top_basement_floor - (top_basement_floor - 0.0), 0.0),
+  }
+
+
+  interfaces = {
+      # Regolith
+      "Topsoil":       top_topsoil,
+      "Subsoil":       top_subsoil,
+      "Colluvium":     top_colluvium,
+      "Saprolite":     top_saprolite,
+      "WeatheredBR":   top_rind,
+
+      # Valley-fill sediments
+      "Clay":          top_clay,
+      "Silt":          top_silt,
+      "Sand":          top_sand,
+
+      # Sedimentary Units
+      "Sandstone":     top_sandstone,
+      "Conglomerate":  top_conglomerate,
+      "Shale":         top_shale,
+      "Mudstone":      top_mudstone,
+      "Siltstone":     top_siltstone,
+      "Limestone":     top_limestone,
+      "Dolomite":      top_dolomite,
+      "Evaporite":     top_evaporite,
+
+      # Crystalline Units
+      "Granite":       top_granite,
+      "Gneiss":        top_gneiss,
+      "Basalt":        top_basalt,
+      "AncientCrust":  top_ancient_crust,
+
+      # Base
+      "Basement":      top_basement,
+      "BasementFloor": top_basement_floor,
+  }
+
+
+    # ---------- 9) Alluvium (channels / floodplains) ----------
+  catch = _box_blur(_box_blur(1.0 - slope_norm, k=7), k=13)
+  wet = _normalize(catch - slope_norm)
+  alluvium = np.where(
+      wet > 0.7,
+      np.minimum(2.0 * rng.random(size=wet.shape), 2.0),
+      0.0,
+  )
+
+  # Glacial / aeolian + fluvial deposit rasters
+  deposits = {
+      "Alluvium": alluvium,
+  }
+
+
+  # ---------- 10) Material properties ----------
+  properties = {
+      # REGOLITH / SOIL
+      "Topsoil": {
+          "erodibility": 1.00,
+          "density":     1600,
+          "porosity":    0.45,
+          "K_rel":       1.00,
+      },
+      "Subsoil": {
+          "erodibility": 0.85,
+          "density":     1700,
+          "porosity":    0.40,
+          "K_rel":       0.85,
+      },
+      "Colluvium": {
+          "erodibility": 0.90,
+          "density":     1750,
+          "porosity":    0.35,
+          "K_rel":       0.90,
+      },
+      "Alluvium": {
+          "erodibility": 0.95,
+          "density":     1700,
+          "porosity":    0.40,
+          "K_rel":       0.95,
+      },
+      "Clay": {
+          "erodibility": 0.80,
+          "density":     1850,
+          "porosity":    0.45,
+          "K_rel":       0.80,
+      },
+      "Silt": {
+          "erodibility": 0.90,
+          "density":     1750,
+          "porosity":    0.42,
+          "K_rel":       0.90,
+      },
+      "Sand": {
+          "erodibility": 0.85,
+          "density":     1700,
+          "porosity":    0.35,
+          "K_rel":       0.85,
+      },
+
+      # WEATHERED ROCK
+      "Saprolite": {
+          "erodibility": 0.70,
+          "density":     1900,
+          "porosity":    0.30,
+          "K_rel":       0.70,
+      },
+      "WeatheredBR": {
+          "erodibility": 0.55,
+          "density":     2100,
+          "porosity":    0.20,
+          "K_rel":       0.55,
+      },
+
+      # SEDIMENTARY ROCKS
+      "Sandstone": {
+          "erodibility": 0.30,
+          "density":     2200,
+          "porosity":    0.18,
+          "K_rel":       0.30,
+      },
+      "Conglomerate": {
+          "erodibility": 0.25,
+          "density":     2300,
+          "porosity":    0.16,
+          "K_rel":       0.25,
+      },
+      "Shale": {
+          "erodibility": 0.45,
+          "density":     2300,
+          "porosity":    0.12,
+          "K_rel":       0.45,
+      },
+      "Mudstone": {
+          "erodibility": 0.45,
+          "density":     2300,
+          "porosity":    0.12,
+          "K_rel":       0.45,
+      },
+      "Siltstone": {
+          "erodibility": 0.35,
+          "density":     2350,
+          "porosity":    0.10,
+          "K_rel":       0.35,
+      },
+      "Limestone": {
+          "erodibility": 0.28,
+          "density":     2400,
+          "porosity":    0.08,
+          "K_rel":       0.28,
+      },
+      "Dolomite": {
+          "erodibility": 0.24,
+          "density":     2450,
+          "porosity":    0.06,
+          "K_rel":       0.24,
+      },
+      "Evaporite": {
+          "erodibility": 0.90,
+          "density":     2200,
+          "porosity":    0.15,
+          "K_rel":       0.90,
+      },
+
+      # CRYSTALLINE BASEMENT
+      "Granite": {
+          "erodibility": 0.15,
+          "density":     2700,
+          "porosity":    0.01,
+          "K_rel":       0.15,
+      },
+      "Gneiss": {
+          "erodibility": 0.16,
+          "density":     2750,
+          "porosity":    0.01,
+          "K_rel":       0.16,
+      },
+      "Basalt": {
+          "erodibility": 0.12,
+          "density":     2950,
+          "porosity":    0.02,
+          "K_rel":       0.12,
+      },
+      "AncientCrust": {
+          "erodibility": 0.14,
+          "density":     2800,
+          "porosity":    0.01,
+          "K_rel":       0.14,
+      },
+      "Basement": {
+          "erodibility": 0.15,
+          "density":     2700,
+          "porosity":    0.01,
+          "K_rel":       0.15,
+      },
+      "BasementFloor": {
+          "erodibility": 0.02,
+          "density":     2850,
+          "porosity":    0.005,
+          "K_rel":       0.02,
+      },
+  }
+
+  facies_controls = {
+      "basins":       basins,
+      "highs":        highs,
+      "paleo_slope":  slope_norm,
+  }
+
+
+  return {
+      "surface_elev": E,
+      "interfaces": interfaces,
+      "thickness": thickness,
+      "properties": properties,
+      "alluvium_init": alluvium,
+      "deposits": deposits,
+      "meta": {
+          "elev_range_m": elev_range_m,
+          "pixel_scale_m": pixel_scale_m,
+          "dip_deg": dip_deg,
+          "dip_dir_deg": dip_dir_deg,
+          "unit_thickness_m": unit_thickness_m,
+          "burial_depth_m": burial_depth_m,
+          "bed_struct_weight": bed_struct_weight,
+          "z_floor": z_floor,
+          "facies_controls": facies_controls,
+      }
+  }
 
 
 # ----------------------- Helper functions for visualization ----------------------
@@ -1260,8 +1605,36 @@ def compute_top_material_map(strata, min_thick=0.05):
     
     # Stratigraphic order (top to bottom)
     strat_order = [
-        "Topsoil", "Subsoil", "Clay", "Silt", "Sand", "Colluvium",
-        "Saprolite", "WeatheredBR", "Sandstone", "Shale", "Limestone", "Basement"
+        # Surface/regolith
+        "Topsoil",
+        "Subsoil",
+        "Colluvium",
+        "Saprolite",
+        "WeatheredBR",
+
+        # Valley-fill sediments
+        "Clay",
+        "Silt",
+        "Sand",
+
+        # Sedimentary package
+        "Sandstone",
+        "Conglomerate",
+        "Shale",
+        "Mudstone",
+        "Siltstone",
+        "Limestone",
+        "Dolomite",
+        "Evaporite",
+
+        # Crystalline/metamorphic
+        "Granite",
+        "Gneiss",
+        "Basalt",
+        "AncientCrust",
+
+        # Base
+        "Basement",
     ]
     strat_order = [k for k in strat_order if k in interfaces]
     
@@ -1319,26 +1692,66 @@ def plot_cross_section(strata, row=None, col=None, min_draw_thickness=0.05, ax=N
 
     # Layer drawing order (top -> bottom)
     order = [
-        "Topsoil", "Subsoil", "Clay", "Silt", "Sand", "Colluvium",
-        "Saprolite", "WeatheredBR", "Sandstone", "Shale", "Limestone",
-        "Basement", "BasementFloor",
+        "Topsoil",
+        "Subsoil",
+        "Colluvium",
+        "Saprolite",
+        "WeatheredBR",
+        
+        # valley-fill sediments
+        "Clay",
+        "Silt",
+        "Sand",
+        
+        # sedimentary package
+        "Sandstone",
+        "Conglomerate",
+        "Shale",
+        "Mudstone",
+        "Siltstone",
+        "Limestone",
+        "Dolomite",
+        "Evaporite",
+        
+        # crystalline/metamorphic
+        "Granite",
+        "Gneiss",
+        "Basalt",
+        "AncientCrust",
+        
+        # base
+        "Basement",
+        "BasementFloor",
     ]
 
-    # Color map
+    # Color map (bright, distinct)
     color_map = {
-        "Topsoil": "sienna",
-        "Subsoil": "peru",
-        "Clay": "lightcoral",
-        "Silt": "thistle",
-        "Sand": "navajowhite",
-        "Colluvium": "burlywood",
-        "Saprolite": "khaki",
-        "WeatheredBR": "darkkhaki",
-        "Sandstone": "orange",
-        "Shale": "slategray",
-        "Limestone": "lightgray",
-        "Basement": "dimgray",
-        "BasementFloor": "black",
+        "Topsoil":      "sienna",
+        "Subsoil":      "peru",
+        "Colluvium":    "burlywood",
+        "Saprolite":    "khaki",
+        "WeatheredBR":  "darkkhaki",
+        
+        "Clay":         "lightcoral",
+        "Silt":         "thistle",
+        "Sand":         "navajowhite",
+        
+        "Sandstone":    "orange",
+        "Conglomerate": "chocolate",
+        "Shale":        "slategray",
+        "Mudstone":     "rosybrown",
+        "Siltstone":    "lightsteelblue",
+        "Limestone":    "lightgray",
+        "Dolomite":     "gainsboro",
+        "Evaporite":    "plum",
+        
+        "Granite":      "lightpink",
+        "Gneiss":       "violet",
+        "Basalt":       "royalblue",
+        "AncientCrust": "darkseagreen",
+        
+        "Basement":     "dimgray",
+        "BasementFloor":"black",
     }
 
     if ax is None:
@@ -1457,12 +1870,19 @@ if __name__ == "__main__":
         N=512, beta=3.2, warp_amp=0.10, ridged_alpha=0.15, random_seed=None
     )
 
-    # Generate stratigraphy (✅ IMPROVED with geologic principles)
+    # Generate stratigraphy with ALL LAYERS RESTORED + basin-responsive behavior
     strata = generate_stratigraphy(
-        z_norm=z,
-        rng=rng,
-        elev_range_m=700.0,
-        pixel_scale_m=10.0,
+        z_norm=z, rng=rng,
+        elev_range_m=700.0, pixel_scale_m=10.0,
+        soil_range_m=(0.3, 1.8),
+        colluvium_max_m=18.0, wC_gentle=0.35, wC_curv=0.30, wC_low=0.20, wC_twi=0.15,
+        C_relief_px=31, C_twi_k1=7, C_twi_k2=13, C_sigma=0.20, C_floor=0.5, C_bias=1.0,
+        sap_median=6.0, sap_min=0.5, sap_max=30.0, sap_w_gentle=0.6, sap_w_inter=0.4, sap_relief_px=61, sap_sigma=0.35,
+        rind_median=1.8, rind_min=0.4, rind_max=6.0, rind_patch_beta=3.0, rind_patch_alpha=0.5,
+        unit_thickness_m=(90.0,110.0,100.0),
+        undulation_amp_m=10.0, undulation_beta=3.2,
+        dip_deg=6.0, dip_dir_deg=45.0,
+        burial_depth_m=120.0, bed_struct_weight=0.45
     )
     
     # Re-zero vertical datum: lowest surface elevation -> 0 m
@@ -1500,7 +1920,7 @@ if __name__ == "__main__":
     
     # Print diagnostic information
     print("\n" + "="*70)
-    print("GEOLOGICAL LAYER GENERATION SUMMARY")
+    print("GEOLOGICAL LAYER GENERATION SUMMARY - BASIN-RESPONSIVE")
     print("="*70)
     print(f"Grid size: {z.shape[0]}x{z.shape[1]}")
     print(f"Elevation range: 0 - {strata['meta']['elev_range_m']:.1f} m")
@@ -1508,8 +1928,40 @@ if __name__ == "__main__":
     print("\nLayer thickness statistics (meters):")
     print("-" * 70)
     for layer_name in ["Topsoil", "Subsoil", "Clay", "Silt", "Sand", "Colluvium", 
-                       "Saprolite", "WeatheredBR", "Sandstone", "Shale", "Limestone"]:
+                       "Saprolite", "WeatheredBR", "Sandstone", "Conglomerate", "Shale", 
+                       "Mudstone", "Siltstone", "Limestone", "Dolomite", "Evaporite",
+                       "Granite", "Gneiss", "Basalt", "AncientCrust"]:
         if layer_name in strata["thickness"]:
             t = strata["thickness"][layer_name]
             print(f"{layer_name:15s}: min={t.min():6.2f}  mean={t.mean():6.2f}  max={t.max():6.2f}")
+    
+    # Check basin/ridge thickness variation
+    print("\n" + "-" * 70)
+    print("✅ VERIFICATION: Basin vs Ridge Thickness Variation")
+    print("-" * 70)
+    basins = strata["meta"]["facies_controls"]["basins"]
+    highs = strata["meta"]["facies_controls"]["highs"]
+    
+    # Find basin vs ridge locations (top/bottom 20%)
+    basin_mask = basins > 0.8
+    ridge_mask = highs > 0.8
+    
+    if np.any(basin_mask) and np.any(ridge_mask):
+        for layer in ["Sandstone", "Shale", "Limestone"]:
+            if layer in strata["thickness"]:
+                t = strata["thickness"][layer]
+                basin_mean = t[basin_mask].mean() if np.any(basin_mask) else 0
+                ridge_mean = t[ridge_mask].mean() if np.any(ridge_mask) else 0
+                ratio = basin_mean / (ridge_mean + 0.1)
+                status = "✅ GOOD" if ratio > 1.2 else "❌ NEEDS FIX"
+                print(f"{layer:15s}: Basin={basin_mean:5.1f}m  Ridge={ridge_mean:5.1f}m  Ratio={ratio:.2f}x  {status}")
+    
+    # Check basement depth variation
+    if "Basement" in strata["interfaces"]:
+        basement_top = strata["interfaces"]["Basement"]
+        basin_depth = -basement_top[basin_mask].mean() if np.any(basin_mask) else 0
+        ridge_depth = -basement_top[ridge_mask].mean() if np.any(ridge_mask) else 0
+        print(f"\nBasement depth:  Basin={basin_depth:6.1f}m  Ridge={ridge_depth:6.1f}m")
+        print(f"  → Basement is {'DEEPER' if basin_depth > ridge_depth else 'SHALLOWER'} under basins {' ✅' if basin_depth > ridge_depth else ' ❌'}")
+    
     print("="*70)
