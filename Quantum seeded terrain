@@ -948,6 +948,48 @@ def generate_stratigraphy(
   basin_geometry = concavity * (1.0 - E_norm)  # Strongest in concave, low areas
   ridge_geometry = convexity * E_norm  # Strongest on convex, high areas
   
+  # ========== TERRAIN METRICS AND CLASSIFICATION ==========
+  # CRITICAL: Classify terrain to control facies distribution
+  # Reference: Geological mapping uses terrain metrics to predict rock types
+  
+  # Compute relative elevation (elevation relative to local neighborhood)
+  k_neighborhood = max(21, int(0.1 * N) | 1)
+  E_smooth_neighborhood = _box_blur(E, k=k_neighborhood)
+  rel_elev = E - E_smooth_neighborhood  # Positive = high relative to neighbors
+  rel_elev_norm = _normalize(rel_elev)  # 0 = low relative, 1 = high relative
+  
+  # Compute local relief (max - min in neighborhood)
+  E_max = np.maximum.reduce([
+      np.roll(E, -k_neighborhood//2, axis=0),
+      np.roll(E, k_neighborhood//2, axis=0),
+      np.roll(E, -k_neighborhood//2, axis=1),
+      np.roll(E, k_neighborhood//2, axis=1)
+  ])
+  E_min = np.minimum.reduce([
+      np.roll(E, -k_neighborhood//2, axis=0),
+      np.roll(E, k_neighborhood//2, axis=0),
+      np.roll(E, -k_neighborhood//2, axis=1),
+      np.roll(E, k_neighborhood//2, axis=1)
+  ])
+  local_relief = E_max - E_min
+  local_relief_norm = _normalize(local_relief)  # 0 = low relief, 1 = high relief
+  
+  # Terrain classification thresholds
+  HIGH_REL_THRESHOLD = 0.6  # High relative elevation
+  HIGH_RELIEF_THRESHOLD = 0.5  # High local relief
+  LOW_REL_THRESHOLD = 0.3  # Low relative elevation
+  CONCAVE_THRESHOLD = 0.6  # Strong concavity
+  
+  # Classify terrain: mountain_core, basin_center, basin_margin
+  mountain_core_mask = (rel_elev_norm > HIGH_REL_THRESHOLD) & (local_relief_norm > HIGH_RELIEF_THRESHOLD)
+  basin_center_mask = (rel_elev_norm < LOW_REL_THRESHOLD) & (concavity > CONCAVE_THRESHOLD)
+  basin_margin_mask = ~(mountain_core_mask | basin_center_mask)  # Everything else
+  
+  # Create terrain class array (0=mountain_core, 1=basin_margin, 2=basin_center)
+  terrain_class = np.zeros_like(E, dtype=int)
+  terrain_class[basin_margin_mask] = 1
+  terrain_class[basin_center_mask] = 2
+  
   # Helper: smoothed random field (quantum-seeded, but laterally coherent)
   def smooth_random_field(k):
       noise = rng.standard_normal(size=E.shape)
@@ -1054,27 +1096,66 @@ def generate_stratigraphy(
   flat_mask = slope_n < 0.1  # Very flat (<10% normalized slope)
   closed_basin_mask = (basin_geometry > 0.7) & (flat_mask) & (E_norm < 0.5)  # Concave, flat, low
   
-  # Facies environments for consolidated sedimentary rocks (deeper package)
-  # - Sandstone: shorelines / basin margins → intermediate basinness, some slope
-  # BUT: Localize to depositional systems, not everywhere
-  sand_env_raw_rock  = basins * (1.0 - basins) * (0.5 + 0.5 * slope_n)
-  # Reduce sandstone in high elevations and steep slopes
-  sand_env_raw_rock = sand_env_raw_rock * np.clip(1.0 - E_norm * 0.8, 0.2, 1.0)
-  sand_env_raw_rock = sand_env_raw_rock * np.clip(1.0 - slope_n * 0.6, 0.3, 1.0)
+  # ========== FACIES WEIGHTS PER TERRAIN CLASS ==========
+  # CRITICAL: Sandstone is a facies, not generic crust
+  # Each terrain class has different facies probabilities
+  # Reference: Facies models depend on depositional environment (Reading, 1996)
   
-  shale_env_raw = basins  # deepening into basins (offshore muds)
+  # Maximum sandstone fraction: sandstone can never exceed 35% of total sediment column
+  MAX_SANDSTONE_FRACTION = 0.35
   
-  # Limestone/Dolomite: ONLY in flat, low-lying areas (shallow marine platforms)
-  # NOT in mountains or steep slopes
-  lime_env_raw = np.where(
-      closed_basin_mask | (flat_mask & (E_norm < 0.4)),  # Flat, low areas only
-      gentle * (1.0 - E_norm),  # Gentle, low elevation
-      0.0  # Zero elsewhere
-  )
+  # Facies weights for each terrain class
+  # These control the probability of each rock type appearing
+  facies_weights = {
+      "Conglomerate": np.zeros_like(E),
+      "Sandstone": np.zeros_like(E),
+      "Shale": np.zeros_like(E),
+      "Mudstone": np.zeros_like(E),
+      "Siltstone": np.zeros_like(E),
+      "Limestone": np.zeros_like(E),
+      "Dolomite": np.zeros_like(E),
+      "Evaporite": np.zeros_like(E),
+  }
   
-  sand_env_rock  = _normalize(sand_env_raw_rock)
-  shale_env = _normalize(shale_env_raw)
-  lime_env  = _normalize(lime_env_raw)
+  # Basin center: favor fines (shale/mudstone), carbonates, minimal sandstone
+  facies_weights["Conglomerate"][basin_center_mask] = 0.05
+  facies_weights["Sandstone"][basin_center_mask] = 0.10  # Small in deep quiet basins
+  facies_weights["Shale"][basin_center_mask] = 0.35
+  facies_weights["Mudstone"][basin_center_mask] = 0.25
+  facies_weights["Siltstone"][basin_center_mask] = 0.15
+  facies_weights["Limestone"][basin_center_mask] = 0.15
+  facies_weights["Dolomite"][basin_center_mask] = 0.05
+  facies_weights["Evaporite"][basin_center_mask] = np.where(closed_basin_mask[basin_center_mask], 0.10, 0.0)
+  
+  # Basin margin: mix of coarse and fine, moderate sandstone
+  facies_weights["Conglomerate"][basin_margin_mask] = 0.15
+  facies_weights["Sandstone"][basin_margin_mask] = 0.18
+  facies_weights["Shale"][basin_margin_mask] = 0.20
+  facies_weights["Mudstone"][basin_margin_mask] = 0.15
+  facies_weights["Siltstone"][basin_margin_mask] = 0.15
+  facies_weights["Limestone"][basin_margin_mask] = 0.10
+  facies_weights["Dolomite"][basin_margin_mask] = 0.05
+  facies_weights["Evaporite"][basin_margin_mask] = 0.02
+  
+  # Mountain core: favor conglomerate, reduce sandstone, expose older units
+  facies_weights["Conglomerate"][mountain_core_mask] = 0.25  # Fans/proximal
+  facies_weights["Sandstone"][mountain_core_mask] = 0.10  # Strongly reduced
+  facies_weights["Shale"][mountain_core_mask] = 0.10
+  facies_weights["Mudstone"][mountain_core_mask] = 0.05
+  facies_weights["Siltstone"][mountain_core_mask] = 0.05
+  facies_weights["Limestone"][mountain_core_mask] = 0.05
+  facies_weights["Dolomite"][mountain_core_mask] = 0.02
+  facies_weights["Evaporite"][mountain_core_mask] = 0.0
+  
+  # Normalize weights to sum to 1.0 for each cell
+  total_weight = sum(facies_weights.values())
+  for facies in facies_weights:
+      facies_weights[facies] = facies_weights[facies] / (total_weight + 1e-9)
+  
+  # Legacy facies environments (for compatibility with existing code)
+  sand_env_rock = facies_weights["Sandstone"]
+  shale_env = facies_weights["Shale"]
+  lime_env = facies_weights["Limestone"] + facies_weights["Dolomite"]
 
 
 
@@ -1121,45 +1202,87 @@ def generate_stratigraphy(
       )
   )
   
-  # Base thickness fields (trend) for each consolidated rock unit
-  base_sandstone  = sed_total * f_sand  * (0.4 + 0.6 * sand_env_rock)
-  base_shale_rock = sed_total * f_shale * (0.3 + 0.7 * shale_env)
-  base_lime_rock  = sed_total * f_lime  * (0.3 + 0.7 * lime_env)
-
+  # ========== BUILD SEDIMENTARY STACK USING FACIES WEIGHTS ==========
+  # CRITICAL: Use facies weights to distribute sediment, not uniform sandstone
+  # Enforce sandstone cap: sandstone cannot exceed MAX_SANDSTONE_FRACTION of total
+  
+  # Calculate base thicknesses for each facies using weights and accommodation
+  # Each facies gets: sed_total * facies_weight * accommodation_factor
+  base_conglomerate = sed_total * facies_weights["Conglomerate"] * accommodation_factor
+  base_sandstone = sed_total * facies_weights["Sandstone"] * accommodation_factor
+  base_shale_rock = sed_total * facies_weights["Shale"] * accommodation_factor
+  base_mudstone = sed_total * facies_weights["Mudstone"] * accommodation_factor
+  base_siltstone = sed_total * facies_weights["Siltstone"] * accommodation_factor
+  base_lime_rock = sed_total * facies_weights["Limestone"] * accommodation_factor
+  base_dolomite = sed_total * facies_weights["Dolomite"] * accommodation_factor
+  base_evaporite = sed_total * facies_weights["Evaporite"] * accommodation_factor
+  
   # Quantum-smoothed variability (keeps sheets coherent, avoids "icicles")
-  rnd_sand  = smooth_random_field(k_thick)
+  rnd_cong = smooth_random_field(k_thick)
+  rnd_sand = smooth_random_field(k_thick)
   rnd_shale = smooth_random_field(k_thick)
-  rnd_lime  = smooth_random_field(k_thick)
-
+  rnd_mud = smooth_random_field(k_thick)
+  rnd_silt = smooth_random_field(k_thick)
+  rnd_lime = smooth_random_field(k_thick)
+  rnd_dolo = smooth_random_field(k_thick)
+  rnd_evap = smooth_random_field(k_thick)
+  
   def apply_variation(base, rnd, amp=0.3):
       std = float(np.std(rnd) + 1e-9)
       f = 1.0 + amp * (rnd / std)
       f = np.clip(f, 0.5, 1.5)
       return np.clip(base * f, 0.0, None)
-
-  t_sandstone_trend  = apply_variation(base_sandstone,  rnd_sand)
-  t_shale_trend = apply_variation(base_shale_rock, rnd_shale)
-  t_lime_trend  = apply_variation(base_lime_rock,  rnd_lime)
-
-  # Apply basin geometry: thicken in basins, thin on ridges
-  t_sandstone_trend  = t_sandstone_trend  * accommodation_factor
-  t_shale_trend = t_shale_trend * accommodation_factor
-  t_lime_trend  = t_lime_trend  * accommodation_factor
-
-  # Thin units on steep slopes (erosion), but maintain minimum thickness
-  # Steep slopes erode more, preserving less sediment
-  thin_factor = 0.3 + 0.7 * gentle  # 1.0 on gentle, 0.3 on steep
-  t_sandstone  = t_sandstone_trend  * thin_factor
-  t_shale_rock = t_shale_trend * thin_factor
   
-  # Limestone: ONLY in flat, low-lying areas (shallow marine platforms)
-  # NOT in mountains or steep slopes
-  lime_restriction = np.where(
-      closed_basin_mask | (flat_mask & (E_norm < 0.4)),  # Flat, low areas only
-      1.0,  # Allow limestone
-      0.0   # Zero elsewhere (mountains, steep slopes)
+  t_conglomerate_trend = apply_variation(base_conglomerate, rnd_cong)
+  t_sandstone_trend = apply_variation(base_sandstone, rnd_sand)
+  t_shale_trend = apply_variation(base_shale_rock, rnd_shale)
+  t_mudstone_trend = apply_variation(base_mudstone, rnd_mud)
+  t_siltstone_trend = apply_variation(base_siltstone, rnd_silt)
+  t_lime_trend = apply_variation(base_lime_rock, rnd_lime)
+  t_dolomite_trend = apply_variation(base_dolomite, rnd_dolo)
+  t_evaporite_trend = apply_variation(base_evaporite, rnd_evap)
+  
+  # Thin units on steep slopes (erosion), but maintain minimum thickness
+  thin_factor = 0.3 + 0.7 * gentle  # 1.0 on gentle, 0.3 on steep
+  
+  t_conglomerate_raw = t_conglomerate_trend * thin_factor
+  t_sandstone_raw = t_sandstone_trend * thin_factor
+  t_shale_rock = t_shale_trend * thin_factor
+  t_mudstone_raw = t_mudstone_trend * thin_factor
+  t_siltstone_raw = t_siltstone_trend * thin_factor
+  t_lime_rock = t_lime_trend * thin_factor
+  t_dolomite_raw = t_dolomite_trend * thin_factor
+  t_evaporite_raw = t_evaporite_trend * thin_factor
+  
+  # ========== ENFORCE SANDSTONE CAP ==========
+  # CRITICAL: Sandstone cannot exceed MAX_SANDSTONE_FRACTION of total sediment
+  # Calculate total sediment thickness
+  total_sediment_thickness = (
+      t_conglomerate_raw + t_sandstone_raw + t_shale_rock + t_mudstone_raw +
+      t_siltstone_raw + t_lime_rock + t_dolomite_raw + t_evaporite_raw
   )
-  t_lime_rock = t_lime_trend * thin_factor * lime_restriction
+  
+  # Calculate maximum allowed sandstone thickness
+  max_sandstone_thickness = total_sediment_thickness * MAX_SANDSTONE_FRACTION
+  
+  # Cap sandstone thickness
+  t_sandstone = np.minimum(t_sandstone_raw, max_sandstone_thickness)
+  
+  # Redistribute excess sandstone to other facies proportionally
+  excess_sandstone = np.maximum(t_sandstone_raw - max_sandstone_thickness, 0.0)
+  if np.any(excess_sandstone > 0):
+      # Distribute excess to shale, mudstone, siltstone (fines)
+      other_facies_total = t_shale_rock + t_mudstone_raw + t_siltstone_raw + 1e-9
+      t_shale_rock = t_shale_rock + excess_sandstone * (t_shale_rock / other_facies_total) * 0.4
+      t_mudstone_raw = t_mudstone_raw + excess_sandstone * (t_mudstone_raw / other_facies_total) * 0.3
+      t_siltstone_raw = t_siltstone_raw + excess_sandstone * (t_siltstone_raw / other_facies_total) * 0.3
+  
+  # Final thicknesses
+  t_conglomerate = t_conglomerate_raw
+  t_mudstone = t_mudstone_raw
+  t_siltstone = t_siltstone_raw
+  t_dolomite = t_dolomite_raw
+  t_evaporite = t_evaporite_raw
 
   # ========== STRATIGRAPHIC INTERFACE CALCULATION ==========
   # Enforce proper stacking: Topsoil → Sand/Silt → Clay → Gravel → Bedrock
@@ -1265,11 +1388,10 @@ def generate_stratigraphy(
   # CRITICAL: All layers must be BELOW surface elevation E
   eps = 0.01
 
-  # ========== SLOPE-DEPENDENT REGOLITH THICKNESS ==========
-  # CRITICAL GEOLOGICAL RULE: Regolith thickness inversely related to slope
+  # ========== SLOPE/CURVATURE-DEPENDENT REGOLITH THICKNESS ==========
+  # CRITICAL GEOLOGICAL RULE: Regolith thickness depends on slope AND curvature
   # Reference: USDA Soil Survey Manual - regolith rarely exceeds few meters on steep terrain
-  # Colluvium accumulates at hillslope bases, not peaks
-  # CRITICAL FIX: Increase base regolith thicknesses significantly to make them visible
+  # Thick on gentle convex/flat surfaces, thin/zero on very steep faces
   
   # Slope-dependent thickness factor: thin on steep slopes, thick on gentle
   # Use gentler decay: thickness = max_thickness * (1 - slope_factor * 0.7)
@@ -1277,23 +1399,32 @@ def generate_stratigraphy(
   slope_decay_factor = np.clip(1.0 - slope_n * 0.7, 0.2, 1.0)  # Gentler decay, minimum 20%
   gentle_slope_factor = np.clip((0.4 - slope_n) / 0.4, 0.0, 1.0)  # On gentle to moderate slopes
   
+  # Curvature factor: thick on gentle convex/flat, thin on concave channels
+  # Convex surfaces (ridges, shoulders): thick regolith
+  # Concave surfaces (channels): thinner regolith (erosion)
+  curvature_factor = np.clip(0.5 + 0.5 * convexity, 0.3, 1.0)  # Thicker on convex
+  
+  # Combined regolith factor: thick on gentle convex/flat, thin on steep/concave
+  regolith_factor = slope_decay_factor * curvature_factor
+  regolith_factor = np.where(slope_n > 0.8, 0.0, regolith_factor)  # Zero on very steep cliffs
+  
   # A and B horizons (Topsoil and Subsoil)
   # INCREASE base thicknesses MUCH MORE - make regolith clearly visible
   # Scale up by another 2-3x as requested
-  topsoil_base = topsoil_thick * 8.0  # 8x topsoil thickness (was 4x, now 2x more)
-  subsoil_base = subsoil_thick * 12.0   # 12x subsoil thickness (was 5x, now 2.4x more)
+  topsoil_base = topsoil_thick * 8.0  # 8x topsoil thickness
+  subsoil_base = subsoil_thick * 12.0   # 12x subsoil thickness
   
-  # Further reduce topsoil on very steep slopes (cliffs, rock faces)
-  steep_cliff_mask = slope_n > 0.85  # Very steep slopes (>85% normalized) - even more restrictive
-  topsoil_thick_adjusted = np.where(steep_cliff_mask, topsoil_base * 0.3, topsoil_base)
+  # Apply regolith factor (slope + curvature dependent)
+  topsoil_thick_adjusted = topsoil_base * regolith_factor
+  subsoil_thick_adjusted = subsoil_base * regolith_factor
   
-  # Apply slope-dependent reduction (gentler than before)
-  topsoil_thick_adjusted = topsoil_thick_adjusted * slope_decay_factor
-  subsoil_thick_adjusted = subsoil_base * slope_decay_factor
+  # Further reduce on very steep slopes (cliffs, rock faces)
+  steep_cliff_mask = slope_n > 0.85  # Very steep slopes (>85% normalized)
+  topsoil_thick_adjusted = np.where(steep_cliff_mask, topsoil_thick_adjusted * 0.3, topsoil_thick_adjusted)
   
   # In mountains, reduce regolith but not as much (still need visible regolith)
-  topsoil_thick_adjusted = topsoil_thick_adjusted * np.where(mountain_mask, 0.6, 1.0)  # Less reduction
-  subsoil_thick_adjusted = subsoil_thick_adjusted * np.where(mountain_mask, 0.6, 1.0)  # Less reduction
+  topsoil_thick_adjusted = topsoil_thick_adjusted * np.where(mountain_mask, 0.6, 1.0)
+  subsoil_thick_adjusted = subsoil_thick_adjusted * np.where(mountain_mask, 0.6, 1.0)
   
   # Surface is E, all layers below it
   top_topsoil   = E
@@ -1307,19 +1438,20 @@ def generate_stratigraphy(
   colluvium_slope_factor = np.clip((0.5 - slope_n) / 0.5, 0.0, 1.0)  # On moderate slopes
   colluvium_location_factor = (0.3 + 0.7 * concavity) * colluvium_slope_factor  # At slope breaks
   
+  # Colluvium: only at footslopes & slope breaks, not everywhere
   # Scale regolith up by another 2-3x as requested
-  tC_adjusted = tC * 10.0 * colluvium_location_factor * np.where(mountain_mask, 0.5, 1.0)  # 10x thickness (was 4x, now 2.5x more)
-  tC_adjusted = np.clip(tC_adjusted, 0.0, 60.0)  # Max 60m colluvium (increased from 40m)
+  tC_adjusted = tC * 10.0 * colluvium_location_factor * regolith_factor * np.where(mountain_mask, 0.5, 1.0)
+  tC_adjusted = np.clip(tC_adjusted, 0.0, 60.0)  # Max 60m colluvium
   
-  # Saprolite: thickest on gentle, stable interfluves
-  # Scale up by another 2-3x
-  tS_adjusted = tS * 12.0 * gentle_slope_factor * np.where(mountain_mask, 0.6, 1.0)  # 12x thickness (was 5x, now 2.4x more)
+  # Saprolite: thickest on gentle, stable interfluves (convex/flat surfaces)
+  # Scale up by another 2-3x, apply regolith factor
+  tS_adjusted = tS * 12.0 * regolith_factor * np.where(mountain_mask, 0.6, 1.0)
   
   top_saprolite = top_colluvium - tC_adjusted
   top_rind      = top_saprolite - tS_adjusted
   
   # Ensure regolith doesn't go below reasonable depth - INCREASE max depth significantly
-  # Scale up to 150m max (was 80m, now ~2x more)
+  # Scale up to 150m max
   top_rind = np.maximum(top_rind, E - 150.0)  # Max 150m regolith
 
   # ========== STRATIGRAPHIC STACKING WITH GEOLOGICAL RULES ==========
@@ -1544,62 +1676,30 @@ def generate_stratigraphy(
   top_limestone = np.minimum(top_limestone, E - eps)
   top_basement  = np.minimum(top_basement,  E - eps)
 
-  # Add intermediate sedimentary layers with proper thickness
-  # In mountains: create varied sedimentary sequences (folded/thrust belts)
-  # Mountains can have: sandstone, shale, limestone in folded sequences
-  # CRITICAL: Apply erosion factor to thin these layers on highs
+  # ========== BUILD INTERFACES FROM FACIES-BASED THICKNESSES ==========
+  # Use the facies-based thicknesses calculated earlier
+  # Stack from top (shale) downward: Shale → Conglomerate → Mudstone → Siltstone → Dolomite → Evaporite
   
-  # Conglomerate: forms in high-energy settings, often in mountain foothills
-  # In mountains: moderate thickness (alluvial fans, mountain-front deposits)
-  # Thin dramatically on highs due to erosion
-  conglomerate_thinning = np.clip(1.0 - erosion_factor * 1.0, 0.0, 1.0)
-  t_conglomerate = np.where(mountain_mask, 12.0, 10.0) * gravel_env * conglomerate_thinning
-  t_conglomerate = np.clip(t_conglomerate, 0.0, 50.0)  # Max constraint
+  # Smooth facies thicknesses to prevent spikes
+  t_conglomerate = _box_blur(t_conglomerate, k=5)
+  t_mudstone = _box_blur(t_mudstone, k=5)
+  t_siltstone = _box_blur(t_siltstone, k=5)
+  t_dolomite = _box_blur(t_dolomite, k=5)
+  t_evaporite = _box_blur(t_evaporite, k=5)
+  
+  # Build interfaces top-down from shale
   top_conglomerate = top_shale - t_conglomerate
-  
-  # Mudstone: fine-grained, deep basins
-  # In mountains: thin (eroded), but can be present in folded sequences
-  # Less thinning than coarse-grained units
-  mudstone_thinning = np.clip(1.0 - erosion_factor * 0.7, 0.3, 1.0)
-  t_mudstone = np.where(mountain_mask, 8.0, 20.0) * clay_env * mudstone_thinning
-  t_mudstone = np.clip(t_mudstone, 0.0, 40.0)  # Max constraint
   top_mudstone = top_conglomerate - t_mudstone
-  
-  # Siltstone: intermediate grain size
-  # In mountains: moderate thickness in sedimentary sequences
-  siltstone_thinning = np.clip(1.0 - erosion_factor * 0.8, 0.2, 1.0)
-  t_siltstone = np.where(mountain_mask, 10.0, 15.0) * silt_env * siltstone_thinning
-  t_siltstone = np.clip(t_siltstone, 0.0, 30.0)  # Max constraint
   top_siltstone = top_mudstone - t_siltstone
-  
-  # Dolomite: carbonate platform
-  # ONLY in flat, low-lying areas (shallow marine platforms)
-  # NOT in mountains or steep slopes
-  t_dolomite = np.where(
-      closed_basin_mask | (flat_mask & (E_norm < 0.4)),  # Flat, low areas only
-      np.where(mountain_mask, 0.0, 12.0) * lime_env * 0.3,  # Zero in mountains
-      0.0  # Zero elsewhere
-  )
-  t_dolomite = np.clip(t_dolomite, 0.0, 50.0)  # Max constraint
   top_dolomite = top_siltstone - t_dolomite
-  
-  # Evaporite: ONLY in closed basins (flat, dry, enclosed basins with restricted drainage)
-  # CRITICAL: Evaporites require closed basins - NO outflow
-  # Reference: USGS Evaporite Basins - require flat, dry, enclosed basins
-  t_evaporite = np.where(
-      closed_basin_mask,  # ONLY in closed basins
-      np.where(mountain_mask, 0.0, 8.0) * basins * 0.2,  # Zero in mountains
-      0.0  # Zero elsewhere (including mountains, steep slopes, open basins)
-  )
-  t_evaporite = np.clip(t_evaporite, 0.0, 20.0)  # Max constraint
   top_evaporite = top_dolomite - t_evaporite
   
-  # Smooth intermediate layers to prevent spikes
-  top_conglomerate = _box_blur(top_conglomerate, k=3)
-  top_mudstone = _box_blur(top_mudstone, k=3)
-  top_siltstone = _box_blur(top_siltstone, k=3)
-  top_dolomite = _box_blur(top_dolomite, k=3)
-  top_evaporite = _box_blur(top_evaporite, k=3)
+  # Smooth interfaces to prevent spikes
+  top_conglomerate = _box_blur(top_conglomerate, k=5)
+  top_mudstone = _box_blur(top_mudstone, k=5)
+  top_siltstone = _box_blur(top_siltstone, k=5)
+  top_dolomite = _box_blur(top_dolomite, k=5)
+  top_evaporite = _box_blur(top_evaporite, k=5)
   
   # Ensure all intermediate layers are below surface and properly ordered
   top_conglomerate = np.minimum(top_conglomerate, E - eps)
