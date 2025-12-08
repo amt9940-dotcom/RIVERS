@@ -1136,6 +1136,18 @@ def generate_stratigraphy(
   crust_mean  = float(crust_thick.mean())
   crust_anom  = (crust_thick - crust_mean) / (crust_mean + 1e-9)
 
+  # ========== EROSION FACTOR: Remove More on Highs/Steep Slopes ==========
+  # CRITICAL GEOLOGICAL RULE: Erosion removes more material on topographic highs
+  # This creates unroofing: deeper units exposed on ridges, basin margins
+  # Reference: Erosion rates increase with elevation and slope (USGS)
+  
+  # Erosion factor: high on highs/steep slopes, low in basins
+  # This will be used to "peel away" layers on topographic highs
+  erosion_factor = E_norm * (0.5 + 0.5 * slope_n)  # Higher on highs and steep slopes
+  erosion_factor = np.clip(erosion_factor, 0.0, 1.0)
+  # Smooth erosion factor to avoid pixel-scale noise
+  erosion_factor = _box_blur(erosion_factor, k=7)
+  
   # ========== MOUNTAIN vs LOWLAND LITHOLOGY LOGIC ==========
   # Mountains: High elevation + steep slopes → expose igneous/metamorphic rocks
   # Lowlands: Thick sedimentary cover, basement deep
@@ -1144,7 +1156,7 @@ def generate_stratigraphy(
   
   # In mountains: reduce sedimentary cover, expose basement/metamorphic rocks
   # In lowlands: thick sedimentary sequences, basement deep
-  mountain_erosion_factor = np.where(mountain_mask, 0.3, 1.0)  # Mountains have less sediment
+  mountain_erosion_factor = np.where(mountain_mask, 0.2, 1.0)  # Mountains have much less sediment
   lowland_sediment_factor = np.where(lowland_mask, 1.5, 1.0)   # Lowlands have more sediment
   
   # ========== BASEMENT DEPTH ENFORCEMENT ==========
@@ -1221,21 +1233,21 @@ def generate_stratigraphy(
   gentle_slope_factor = np.clip((0.4 - slope_n) / 0.4, 0.0, 1.0)  # On gentle to moderate slopes
   
   # A and B horizons (Topsoil and Subsoil)
-  # INCREASE base thicknesses significantly
-  topsoil_base = topsoil_thick * 2.0  # Double topsoil thickness
-  subsoil_base = subsoil_thick * 2.5   # Increase subsoil thickness
+  # INCREASE base thicknesses MUCH MORE - make regolith clearly visible
+  topsoil_base = topsoil_thick * 4.0  # Quadruple topsoil thickness (was 2x)
+  subsoil_base = subsoil_thick * 5.0   # Increase subsoil thickness significantly (was 2.5x)
   
   # Further reduce topsoil on very steep slopes (cliffs, rock faces)
-  steep_cliff_mask = slope_n > 0.8  # Very steep slopes (>80% normalized) - more restrictive
-  topsoil_thick_adjusted = np.where(steep_cliff_mask, topsoil_base * 0.2, topsoil_base)
+  steep_cliff_mask = slope_n > 0.85  # Very steep slopes (>85% normalized) - even more restrictive
+  topsoil_thick_adjusted = np.where(steep_cliff_mask, topsoil_base * 0.3, topsoil_base)
   
   # Apply slope-dependent reduction (gentler than before)
   topsoil_thick_adjusted = topsoil_thick_adjusted * slope_decay_factor
   subsoil_thick_adjusted = subsoil_base * slope_decay_factor
   
   # In mountains, reduce regolith but not as much (still need visible regolith)
-  topsoil_thick_adjusted = topsoil_thick_adjusted * np.where(mountain_mask, 0.5, 1.0)  # Less reduction
-  subsoil_thick_adjusted = subsoil_thick_adjusted * np.where(mountain_mask, 0.5, 1.0)  # Less reduction
+  topsoil_thick_adjusted = topsoil_thick_adjusted * np.where(mountain_mask, 0.6, 1.0)  # Less reduction
+  subsoil_thick_adjusted = subsoil_thick_adjusted * np.where(mountain_mask, 0.6, 1.0)  # Less reduction
   
   # Surface is E, all layers below it
   top_topsoil   = E
@@ -1249,18 +1261,18 @@ def generate_stratigraphy(
   colluvium_slope_factor = np.clip((0.5 - slope_n) / 0.5, 0.0, 1.0)  # On moderate slopes
   colluvium_location_factor = (0.3 + 0.7 * concavity) * colluvium_slope_factor  # At slope breaks
   
-  tC_adjusted = tC * 2.0 * colluvium_location_factor * np.where(mountain_mask, 0.4, 1.0)  # Double thickness
-  tC_adjusted = np.clip(tC_adjusted, 0.0, 30.0)  # Max 30m colluvium (increased from 20m)
+  tC_adjusted = tC * 4.0 * colluvium_location_factor * np.where(mountain_mask, 0.5, 1.0)  # Quadruple thickness (was 2x)
+  tC_adjusted = np.clip(tC_adjusted, 0.0, 40.0)  # Max 40m colluvium (increased from 30m)
   
   # Saprolite: thickest on gentle, stable interfluves
-  # INCREASE saprolite thickness significantly
-  tS_adjusted = tS * 2.5 * gentle_slope_factor * np.where(mountain_mask, 0.5, 1.0)  # Increase thickness
+  # INCREASE saprolite thickness MUCH MORE
+  tS_adjusted = tS * 5.0 * gentle_slope_factor * np.where(mountain_mask, 0.6, 1.0)  # Much more thickness (was 2.5x)
   
   top_saprolite = top_colluvium - tC_adjusted
   top_rind      = top_saprolite - tS_adjusted
   
-  # Ensure regolith doesn't go below reasonable depth - INCREASE max depth
-  top_rind = np.maximum(top_rind, E - 50.0)  # Max 50m regolith (increased from 20m)
+  # Ensure regolith doesn't go below reasonable depth - INCREASE max depth significantly
+  top_rind = np.maximum(top_rind, E - 80.0)  # Max 80m regolith (increased from 50m)
 
   # ========== STRATIGRAPHIC STACKING WITH GEOLOGICAL RULES ==========
   # Order from top to bottom: Topsoil → Sand/Silt → Clay → Gravel → Bedrock
@@ -1328,11 +1340,28 @@ def generate_stratigraphy(
   # separated by shale/silt/mudstone layers
   # This creates realistic stratigraphic sequences, not one mega-layer
   
+  # REDUCE GLOBAL FRACTION OF SANDSTONE
+  # Reduce base sandstone thickness significantly
+  base_sandstone = base_sandstone * 0.4  # Reduce to 40% of original
+  
   # Sandstone restriction: MUCH stronger - localize to specific environments
-  sandstone_elevation_factor = np.clip(1.0 - E_norm * 1.2, 0.0, 1.0)  # Strong reduction in high elevations
-  sandstone_slope_factor = np.clip(1.0 - slope_n * 1.0, 0.0, 1.0)  # Strong reduction on steep slopes
+  sandstone_elevation_factor = np.clip(1.0 - E_norm * 1.5, 0.0, 1.0)  # Very strong reduction in high elevations
+  sandstone_slope_factor = np.clip(1.0 - slope_n * 1.2, 0.0, 1.0)  # Very strong reduction on steep slopes
   sandstone_basin_factor = basins * (1.0 - basins)  # Prefer basin margins, not everywhere
-  sandstone_restriction = sandstone_elevation_factor * sandstone_slope_factor * (0.3 + 0.7 * sandstone_basin_factor)
+  sandstone_restriction = sandstone_elevation_factor * sandstone_slope_factor * (0.2 + 0.8 * sandstone_basin_factor)
+  
+  # ========== DRAMATIC THINNING OVER HIGHS ==========
+  # CRITICAL: Sandstone must thin dramatically over highs and pinch out completely
+  # Use convexity (ridges) and erosion factor to create strong thinning
+  ridge_thinning = np.clip(1.0 - convexity * 2.0, 0.0, 1.0)  # Thin dramatically on ridges
+  high_elevation_thinning = np.clip(1.0 - E_norm * 1.5, 0.0, 1.0)  # Thin on highs
+  erosion_thinning = np.clip(1.0 - erosion_factor * 1.2, 0.0, 1.0)  # Thin where erosion is high
+  
+  # Combined thinning factor: sandstone pinches out on highs
+  sandstone_thinning_factor = ridge_thinning * high_elevation_thinning * erosion_thinning
+  sandstone_thinning_factor = np.clip(sandstone_thinning_factor, 0.0, 1.0)
+  # Smooth to avoid pixel-scale noise
+  sandstone_thinning_factor = _box_blur(sandstone_thinning_factor, k=7)
   
   # Create VARIABLE sandstone intervals - not uniform
   # Use multiple random fields to create patchy distribution
@@ -1340,16 +1369,19 @@ def generate_stratigraphy(
   sandstone_patch2 = smooth_random_field(k_thick * 3)  # Finer patches
   sandstone_variability = _normalize(sandstone_patch1 + sandstone_patch2 * 0.5)
   
-  # Sandstone only appears where restriction AND variability allow
-  sandstone_presence = sandstone_restriction * sandstone_variability
+  # Sandstone only appears where restriction AND variability AND thinning allow
+  # On highs, sandstone_thinning_factor approaches 0, pinching out sandstone
+  sandstone_presence = sandstone_restriction * sandstone_variability * sandstone_thinning_factor
   sandstone_presence = np.clip(sandstone_presence, 0.0, 1.0)
   
   # Adjust sedimentary rock thickness based on terrain
-  # Sandstone: MUCH more variable, localized, and responsive to basins
-  t_sandstone_adjusted = t_sandstone * np.where(mountain_mask, 0.1, lowland_sediment_factor) * sandstone_presence * accommodation_factor
+  # Sandstone: MUCH more variable, localized, thins dramatically on highs, pinches out
+  t_sandstone_adjusted = t_sandstone * np.where(mountain_mask, 0.05, lowland_sediment_factor) * sandstone_presence * accommodation_factor
   
   # Shale: thickens strongly in basins, forms between sandstone intervals
-  t_shale_adjusted = t_shale_rock * np.where(mountain_mask, 0.2, lowland_sediment_factor) * accommodation_factor
+  # Also thin on highs due to erosion
+  shale_thinning = np.clip(1.0 - erosion_factor * 0.8, 0.2, 1.0)  # Less thinning than sandstone
+  t_shale_adjusted = t_shale_rock * np.where(mountain_mask, 0.2, lowland_sediment_factor) * accommodation_factor * shale_thinning
   
   # Limestone: only in appropriate environments
   t_lime_adjusted = t_lime_rock * np.where(mountain_mask, 0.2, lowland_sediment_factor) * accommodation_factor
@@ -1360,9 +1392,22 @@ def generate_stratigraphy(
   t_lime_adjusted = _box_blur(t_lime_adjusted, k=5)
   
   # Base interfaces for consolidated sedimentary rocks
+  # CRITICAL: When sandstone pinches out on highs, deeper units (shale, limestone) should be exposed
+  # The natural calculation (top_shale = top_sandstone - t_sandstone) already handles this:
+  # when t_sandstone is small, shale is closer to surface
   top_sandstone_raw = np.minimum(top_sed_ref, top_valley_fill_bottom - eps)
   top_shale_raw     = top_sandstone_raw - t_sandstone_adjusted
   top_limestone_raw = top_shale_raw     - t_shale_adjusted
+  
+  # On highly eroded highs, ensure deeper units can reach closer to surface
+  # This creates unroofing: shale/limestone exposed on ridges
+  high_erosion_mask = erosion_factor > 0.7  # Highly eroded areas
+  # On highs, allow shale to be closer to surface (erosion has removed overlying sandstone)
+  top_shale_raw = np.where(
+      high_erosion_mask,
+      np.maximum(top_shale_raw, top_valley_fill_bottom - 10.0),  # Closer to surface on highs
+      top_shale_raw
+  )
   
   # ========== MOUNTAIN LITHOLOGY VARIETY ==========
   # In mountains: expose igneous/metamorphic rocks, reduce sedimentary cover
@@ -1437,22 +1482,28 @@ def generate_stratigraphy(
   # Add intermediate sedimentary layers with proper thickness
   # In mountains: create varied sedimentary sequences (folded/thrust belts)
   # Mountains can have: sandstone, shale, limestone in folded sequences
+  # CRITICAL: Apply erosion factor to thin these layers on highs
   
   # Conglomerate: forms in high-energy settings, often in mountain foothills
   # In mountains: moderate thickness (alluvial fans, mountain-front deposits)
-  t_conglomerate = np.where(mountain_mask, 12.0, 10.0) * gravel_env
+  # Thin dramatically on highs due to erosion
+  conglomerate_thinning = np.clip(1.0 - erosion_factor * 1.0, 0.0, 1.0)
+  t_conglomerate = np.where(mountain_mask, 12.0, 10.0) * gravel_env * conglomerate_thinning
   t_conglomerate = np.clip(t_conglomerate, 0.0, 50.0)  # Max constraint
   top_conglomerate = top_shale - t_conglomerate
   
   # Mudstone: fine-grained, deep basins
   # In mountains: thin (eroded), but can be present in folded sequences
-  t_mudstone = np.where(mountain_mask, 8.0, 20.0) * clay_env
+  # Less thinning than coarse-grained units
+  mudstone_thinning = np.clip(1.0 - erosion_factor * 0.7, 0.3, 1.0)
+  t_mudstone = np.where(mountain_mask, 8.0, 20.0) * clay_env * mudstone_thinning
   t_mudstone = np.clip(t_mudstone, 0.0, 40.0)  # Max constraint
   top_mudstone = top_conglomerate - t_mudstone
   
   # Siltstone: intermediate grain size
   # In mountains: moderate thickness in sedimentary sequences
-  t_siltstone = np.where(mountain_mask, 10.0, 15.0) * silt_env
+  siltstone_thinning = np.clip(1.0 - erosion_factor * 0.8, 0.2, 1.0)
+  t_siltstone = np.where(mountain_mask, 10.0, 15.0) * silt_env * siltstone_thinning
   t_siltstone = np.clip(t_siltstone, 0.0, 30.0)  # Max constraint
   top_siltstone = top_mudstone - t_siltstone
   
