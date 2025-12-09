@@ -1,0 +1,116 @@
+================================================================================
+QUICK REFERENCE: Debugging "AFTER: Elevation Shows Dots"
+================================================================================
+
+FILES TO UPDATE IN YOUR NOTEBOOK:
+  ⭐ NOTEBOOK_CELL_2_erosion_model.py → Replace Cell 2
+  ⭐ NOTEBOOK_CELL_3_weather_driven.py → Replace Cell 3
+
+START HERE:
+  📖 ELEVATION_PLOT_FIX_INSTRUCTIONS.md
+
+================================================================================
+DIAGNOSTIC CHECKLIST
+================================================================================
+
+When you run Cell 3, look for these values:
+
+□ Initial surface range: _______  to  _______ m
+  ✓ Good: 800-1200 m
+  ✗ Bad: Any other range
+
+□ Final surface range: _______  to  _______ m
+  ✓ Good: 795-1205 m (close to initial)
+  ✗ Bad: -50000 m (BasementFloor bug)
+  ✗ Bad: -5 to +5 m (erosion depth bug)
+
+□ Mean change: _______ m
+  ✓ Good: -1 to -10 m (net erosion)
+  ✗ Bad: 0.000001 m (erosion too small)
+  ✗ Bad: 0.00 m exactly (balanced by uplift)
+
+□ Are they the same object? _______
+  ✓ Good: False
+  ✗ Bad: True (shallow copy bug)
+
+□ First epoch total erosion: _______ m avg
+  ✓ Good: 0.01 to 10 m
+  ✗ Bad: 0.000001 m (too small)
+  ✗ Bad: 100000 m (units bug)
+
+================================================================================
+COMMON FIXES
+================================================================================
+
+IF final surface is -50000 to -48000 m:
+  → You're plotting BasementFloor
+  → FIX: Use strata["surface_elev"] not strata["interfaces"]["BasementFloor"]
+
+IF final surface is -5 to +5 m:
+  → You're plotting erosion depth
+  → FIX: Change np.zeros_like(...) - erosion to surface_elev.copy() - erosion
+
+IF "same object" is True:
+  → Shallow copy
+  → FIX: Change strata.copy() to copy.deepcopy(strata)
+
+IF mean change is 0.000001 m:
+  → Erosion too small
+  → FIX: Increase K_channel to 1e-4, D_hillslope to 0.1, dt to 10000
+
+IF mean change is 0.00 m:
+  → Balanced by uplift
+  → FIX: Set uplift_rate = 0.0
+
+================================================================================
+TESTING SEQUENCE
+================================================================================
+
+Level 1: python3 TEST_EROSION.py
+  → Tests basic array subtraction
+  → Should print: ✓ TEST PASSED
+
+Level 2: python3 TEST_FULL_EROSION.py
+  → Tests deep copy + erosion
+  → Should print: ✓ TEST PASSED
+
+Level 3: Run MINIMAL_TEST_CELL.py in notebook
+  → Tests standalone erosion
+  → Should show 3 terrain plots
+
+Level 4: Run updated Cell 2 and Cell 3
+  → Tests full system
+  → Should show diagnostic output + terrain plots
+
+================================================================================
+EXPECTED OUTPUT (WHEN WORKING)
+================================================================================
+
+Diagnostic Output:
+  ✅ Initial surface: 800-1200 m
+  ✅ Final surface: 795-1205 m
+  ✅ Mean change: -2 to -10 m
+  ✅ Same object: False
+  ✅ Erosion: 0.01-10 m avg
+
+Plots:
+  ✅ BEFORE: Full terrain map (mountains, valleys)
+  ✅ AFTER: Similar terrain, subtly modified
+  ✅ DIFFERENCE: Red (erosion) in channels, blue (deposition) in basins
+
+NOT: Dots, solid colors, blank plots, or tiny specks
+
+================================================================================
+IF STILL BROKEN
+================================================================================
+
+Send me these 5 values from the diagnostic output:
+  1. Initial surface range: _____ - _____ m
+  2. Final surface range: _____ - _____ m
+  3. Mean change: _____ m
+  4. Same object: _____
+  5. First epoch erosion: _____ m
+
+With these, I can tell you EXACTLY what's wrong!
+
+================================================================================
