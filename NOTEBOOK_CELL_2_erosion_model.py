@@ -610,10 +610,18 @@ def run_erosion_epoch(
     
     # Step 6a: Apply erosion
     total_erosion = np.maximum(erosion_channel, 0) + np.maximum(erosion_hillslope, 0)
+    
+    # DEBUG: Check surface before erosion
+    surf_before = strata["surface_elev"].copy()
+    
     update_stratigraphy_with_erosion(strata, total_erosion, pixel_scale_m)
     
     # Step 6b: Apply deposition
     update_stratigraphy_with_deposition(strata, deposition, pixel_scale_m)
+    
+    # DEBUG: Check surface after
+    surf_after = strata["surface_elev"]
+    actual_change = surf_after - surf_before
     
     return {
         "erosion_channel": erosion_channel,
@@ -621,6 +629,7 @@ def run_erosion_epoch(
         "deposition": deposition,
         "flow_data": flow_data,
         "total_erosion": total_erosion,
+        "actual_surface_change": actual_change,  # DEBUG
     }
 
 

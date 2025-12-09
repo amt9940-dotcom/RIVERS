@@ -177,6 +177,12 @@ plt.show()
 # Save initial state
 strata_initial = copy.deepcopy(strata)
 
+# DIAGNOSTIC: Check initial state
+print(f"\n   ✓ Initial state captured:")
+print(f"     Surface range: {strata_initial['surface_elev'].min():.2f} - {strata_initial['surface_elev'].max():.2f} m")
+print(f"     Surface mean: {strata_initial['surface_elev'].mean():.2f} m")
+print(f"     Surface dtype: {strata_initial['surface_elev'].dtype}")
+
 # -----------------------------------------------------------------------------
 # STEP 3: Create weather-driven rainfall generator
 # -----------------------------------------------------------------------------
@@ -320,6 +326,49 @@ history = run_erosion_simulation(
 print("   " + "=" * 70)
 print("   ✓ Simulation complete!")
 
+# DEBUG: Check first and last epoch changes
+if len(history) > 0:
+    first_epoch = history[0]
+    last_epoch = history[-1]
+    
+    print(f"\n   DEBUG: First epoch diagnostics:")
+    print(f"     Erosion (channel): {first_epoch['erosion_channel'].mean():.6f} m avg, {first_epoch['erosion_channel'].max():.6f} m max")
+    print(f"     Erosion (hillslope): {first_epoch['erosion_hillslope'].mean():.6f} m avg, {first_epoch['erosion_hillslope'].max():.6f} m max")
+    print(f"     Deposition: {first_epoch['deposition'].mean():.6f} m avg, {first_epoch['deposition'].max():.6f} m max")
+    print(f"     Total erosion: {first_epoch['total_erosion'].mean():.6f} m avg, {first_epoch['total_erosion'].max():.6f} m max")
+    
+    if "actual_surface_change" in first_epoch:
+        asc = first_epoch["actual_surface_change"]
+        print(f"     Surface change: {asc.min():.6f} to {asc.max():.6f} m")
+        print(f"     Mean change: {asc.mean():.6f} m")
+        print(f"     Non-zero cells: {np.sum(np.abs(asc) > 1e-9)}")
+    
+    print(f"\n   DEBUG: Last epoch diagnostics:")
+    print(f"     Erosion (channel): {last_epoch['erosion_channel'].mean():.6f} m avg, {last_epoch['erosion_channel'].max():.6f} m max")
+    print(f"     Total erosion: {last_epoch['total_erosion'].mean():.6f} m avg, {last_epoch['total_erosion'].max():.6f} m max")
+    print(f"     Deposition: {last_epoch['deposition'].mean():.6f} m avg, {last_epoch['deposition'].max():.6f} m max")
+
+# DIAGNOSTIC: Check final state
+print(f"\n   ✓ Final state:")
+print(f"     Surface range: {strata['surface_elev'].min():.2f} - {strata['surface_elev'].max():.2f} m")
+print(f"     Surface mean: {strata['surface_elev'].mean():.2f} m")
+print(f"     Surface dtype: {strata['surface_elev'].dtype}")
+print(f"     Has NaN: {np.any(np.isnan(strata['surface_elev']))}")
+print(f"     Has Inf: {np.any(np.isinf(strata['surface_elev']))}")
+
+# Check if it's the basement floor by mistake
+if "interfaces" in strata and "BasementFloor" in strata["interfaces"]:
+    bf_range = f"{strata['interfaces']['BasementFloor'].min():.1f} - {strata['interfaces']['BasementFloor'].max():.1f}"
+    print(f"     BasementFloor range: {bf_range} m (for comparison)")
+
+# Compare to initial
+delta_check = strata['surface_elev'] - strata_initial['surface_elev']
+print(f"   ✓ Change statistics:")
+print(f"     Min change: {delta_check.min():.2f} m")
+print(f"     Max change: {delta_check.max():.2f} m")
+print(f"     Mean change: {delta_check.mean():.2f} m")
+print(f"     Cells changed: {np.sum(np.abs(delta_check) > 0.01)} / {delta_check.size}")
+
 # -----------------------------------------------------------------------------
 # STEP 6: Statistics
 # -----------------------------------------------------------------------------
@@ -358,6 +407,21 @@ print(f"     Wind channels: {erosion_in_channels:.2f} m average")
 # STEP 7: Enhanced visualizations
 # -----------------------------------------------------------------------------
 print("\n8. Creating visualizations...")
+
+# CRITICAL DEBUG: Verify arrays are actually different
+print("\n   DEBUG: Verifying data integrity before plotting:")
+print(f"     strata_initial['surface_elev'] id: {id(strata_initial['surface_elev'])}")
+print(f"     strata['surface_elev'] id: {id(strata['surface_elev'])}")
+print(f"     Are they the same object? {strata_initial['surface_elev'] is strata['surface_elev']}")
+print(f"     Initial mean: {strata_initial['surface_elev'].mean():.4f} m")
+print(f"     Final mean: {strata['surface_elev'].mean():.4f} m")
+print(f"     Difference: {(strata['surface_elev'] - strata_initial['surface_elev']).mean():.4f} m")
+
+if strata_initial['surface_elev'] is strata['surface_elev']:
+    print("   ⚠ WARNING: strata_initial and strata point to the SAME array!")
+    print("   This means the copy was shallow, not deep!")
+else:
+    print("   ✓ Arrays are separate (deep copy worked)")
 
 final_flow = history[-1]["flow_data"]
 discharge = final_flow["discharge"]
