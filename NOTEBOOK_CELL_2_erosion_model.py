@@ -564,8 +564,13 @@ def run_erosion_epoch(
             - flow_data: dict
     """
     # Step 1: Uplift
-    if uplift_rate != 0:
-        apply_uplift(strata, uplift_rate, dt)
+    # Handle both scalar and array uplift rates
+    if np.isscalar(uplift_rate):
+        if uplift_rate != 0:
+            apply_uplift(strata, uplift_rate, dt)
+    else:
+        if np.any(uplift_rate != 0):
+            apply_uplift(strata, uplift_rate, dt)
     
     # Step 2: Route flow
     flow_data = route_flow_simple(
