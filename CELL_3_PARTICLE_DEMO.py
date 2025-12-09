@@ -145,69 +145,77 @@ print(f"   Balance: {(total_deposition_sum - total_erosion_sum) / total_erosion_
 print("\n🎨 CREATING VISUALIZATIONS...")
 
 fig, axes = plt.subplots(2, 3, figsize=(20, 14))
-fig.suptitle(f"PARTICLE EROSION: {num_epochs * dt * 100:.0f} Real Years Simulated", 
+fig.suptitle(f"PARTICLE EROSION: {num_epochs * dt * 100:.0f} Real Years Simulated\n" +
+             f"(Each of {num_epochs} epochs simulated {dt:.0f} years × {100}× acceleration)", 
              fontsize=16, fontweight='bold')
 
 # Row 1: Before, After, Change
 ax = axes[0, 0]
 im = ax.imshow(elevation_initial, cmap='terrain', interpolation='bilinear')
-ax.set_title(f"BEFORE: Elevation\nRange: {elevation_initial.min():.0f}-{elevation_initial.max():.0f} m", 
+ax.set_title(f"1. BEFORE: Initial Elevation\nRange: {elevation_initial.min():.0f}-{elevation_initial.max():.0f} m", 
              fontsize=12, fontweight='bold')
 ax.axis('off')
 plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Elevation (m)')
+ax.text(0.5, -0.08, "Your original terrain (unchanged)", 
+        transform=ax.transAxes, ha='center', fontsize=9, style='italic', color='green')
 
 ax = axes[0, 1]
 im = ax.imshow(elevation_final, cmap='terrain', interpolation='bilinear')
-ax.set_title(f"AFTER: Elevation\nRange: {elevation_final.min():.0f}-{elevation_final.max():.0f} m", 
+ax.set_title(f"2. AFTER: Final Elevation\nRange: {elevation_final.min():.0f}-{elevation_final.max():.0f} m", 
              fontsize=12, fontweight='bold')
 ax.axis('off')
 plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Elevation (m)')
+ax.text(0.5, -0.08, "Terrain after erosion simulation", 
+        transform=ax.transAxes, ha='center', fontsize=9, style='italic', color='blue')
 
 ax = axes[0, 2]
 # Use diverging colormap for change
 vmax_change = max(abs(total_change.min()), abs(total_change.max()))
 im = ax.imshow(total_change, cmap='RdBu_r', interpolation='bilinear',
                vmin=-vmax_change, vmax=vmax_change)
-ax.set_title(f"CHANGE (Δz)\nRange: {total_change.min():.1f} to {total_change.max():.1f} m", 
+ax.set_title(f"3. TOTAL CHANGE (AFTER - BEFORE)\nRange: {total_change.min():.1f} to {total_change.max():.1f} m", 
              fontsize=12, fontweight='bold')
 ax.axis('off')
 plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Elevation Change (m)')
+ax.text(0.5, -0.08, "Red = lowered (eroded), Blue = raised (deposited)", 
+        transform=ax.transAxes, ha='center', fontsize=9, style='italic', color='purple')
 
-# Add text annotation
-change_pct = (elevation_final.max() - elevation_final.min()) / (elevation_initial.max() - elevation_initial.min()) * 100
-ax.text(0.5, -0.05, f"Relief change: {change_pct:.1f}% of initial", 
-        transform=ax.transAxes, ha='center', fontsize=10, style='italic')
-
-# Row 2: Cumulative erosion, deposition, net
+# Row 2: Cumulative erosion, deposition, net (these are the ACTUAL applied changes)
 cumulative_erosion = sum([h["erosion"] for h in history])
 cumulative_deposition = sum([h["deposition"] for h in history])
 
 ax = axes[1, 0]
 im = ax.imshow(cumulative_erosion, cmap='Reds', interpolation='bilinear')
-ax.set_title(f"Cumulative EROSION\nTotal: {cumulative_erosion.sum():.0f} m³", 
+ax.set_title(f"4. WHERE Surface Was LOWERED\nMax: {cumulative_erosion.max():.1f} m", 
              fontsize=12, fontweight='bold')
 ax.axis('off')
-plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Erosion (m)')
+plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Lowering (m)')
+ax.text(0.5, -0.08, f"Shows locations where elevation decreased (avg: {cumulative_erosion.mean():.2f} m)", 
+        transform=ax.transAxes, ha='center', fontsize=9, style='italic', color='darkred')
 
 ax = axes[1, 1]
 im = ax.imshow(cumulative_deposition, cmap='Blues', interpolation='bilinear')
-ax.set_title(f"Cumulative DEPOSITION\nTotal: {cumulative_deposition.sum():.0f} m³", 
+ax.set_title(f"5. WHERE Surface Was RAISED\nMax: {cumulative_deposition.max():.1f} m", 
              fontsize=12, fontweight='bold')
 ax.axis('off')
-plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Deposition (m)')
+plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Raising (m)')
+ax.text(0.5, -0.08, f"Shows locations where elevation increased (avg: {cumulative_deposition.mean():.2f} m)", 
+        transform=ax.transAxes, ha='center', fontsize=9, style='italic', color='darkblue')
 
 ax = axes[1, 2]
 net_change = cumulative_deposition - cumulative_erosion
 vmax_net = max(abs(net_change.min()), abs(net_change.max()))
 im = ax.imshow(net_change, cmap='RdBu_r', interpolation='bilinear',
                vmin=-vmax_net, vmax=vmax_net)
-ax.set_title(f"NET CHANGE\n(Deposition - Erosion)", 
+ax.set_title(f"6. NET SURFACE CHANGE\n(Raising - Lowering)", 
              fontsize=12, fontweight='bold')
 ax.axis('off')
 plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Net Change (m)')
+ax.text(0.5, -0.08, "Same as plot 3, but computed differently (should match!)", 
+        transform=ax.transAxes, ha='center', fontsize=9, style='italic', color='purple')
 
 plt.tight_layout(rect=[0, 0, 1, 0.97])
-plt.savefig('/workspace/particle_erosion_results.png', dpi=150, bbox_inches='tight')
+plt.savefig('particle_erosion_results.png', dpi=150, bbox_inches='tight')
 print(f"   ✓ Saved: particle_erosion_results.png")
 plt.show()
 
@@ -252,7 +260,7 @@ ax.legend(loc='best', framealpha=0.9)
 ax.grid(True, alpha=0.3)
 
 plt.tight_layout(rect=[0, 0, 1, 0.96])
-plt.savefig('/workspace/particle_erosion_cross_section.png', dpi=150, bbox_inches='tight')
+plt.savefig('particle_erosion_cross_section.png', dpi=150, bbox_inches='tight')
 print(f"   ✓ Saved: particle_erosion_cross_section.png")
 plt.show()
 

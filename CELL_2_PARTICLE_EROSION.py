@@ -305,19 +305,23 @@ def update_stratigraphy_simple(strata, erosion, deposition, pixel_scale_m):
     Simple stratigraphy update.
     
     Just modify surface elevation for now.
+    Returns the actual applied change for accurate diagnostics.
     """
     # Net change
     net_change = deposition - erosion
     
     # Bound changes to prevent blow-up
     max_change = 10.0  # meters per step
-    net_change = np.clip(net_change, -max_change, max_change)
+    net_change_clamped = np.clip(net_change, -max_change, max_change)
     
     # Apply
-    strata["surface_elev"] += net_change
+    strata["surface_elev"] += net_change_clamped
     
-    # Ensure positive elevations (optional)
-    strata["surface_elev"] = np.maximum(strata["surface_elev"], 0.0)
+    # Optional: Ensure positive elevations (commented out to allow true lowering)
+    # Uncomment this line if you want to prevent elevations below 0:
+    # strata["surface_elev"] = np.maximum(strata["surface_elev"], 0.0)
+    
+    return net_change_clamped
 
 
 # ==============================================================================
@@ -331,18 +335,23 @@ def run_particle_erosion_epoch(strata, pixel_scale_m, dt,
     
     print(f"   Simulating {dt} years (= {dt * TIME_ACCELERATION:.0f} real years)...")
     
-    erosion, deposition = apply_combined_erosion(
+    erosion_raw, deposition_raw = apply_combined_erosion(
         strata, pixel_scale_m, dt,
         num_particles_per_year=num_particles_per_year,
         erosion_strength=erosion_strength
     )
     
-    update_stratigraphy_simple(strata, erosion, deposition, pixel_scale_m)
+    # Update stratigraphy and get ACTUAL applied change (post-clamp)
+    net_change_applied = update_stratigraphy_simple(strata, erosion_raw, deposition_raw, pixel_scale_m)
+    
+    # Separate into erosion/deposition for visualization
+    erosion_applied = np.maximum(-net_change_applied, 0)  # Positive where surface lowered
+    deposition_applied = np.maximum(net_change_applied, 0)  # Positive where surface raised
     
     return {
-        "erosion": erosion,
-        "deposition": deposition,
-        "total_erosion": erosion,
+        "erosion": erosion_applied,  # Actual applied erosion (clamped)
+        "deposition": deposition_applied,  # Actual applied deposition (clamped)
+        "net_change": net_change_applied,  # Net change at surface
     }
 
 
@@ -377,8 +386,9 @@ def run_particle_erosion_simulation(strata, pixel_scale_m, num_epochs, dt,
         
         if verbose:
             print(f"  ✓ Epoch complete")
-            print(f"     Erosion: {diagnostics['erosion'].mean():.3f} m avg, {diagnostics['erosion'].max():.3f} m max")
-            print(f"     Deposition: {diagnostics['deposition'].mean():.3f} m avg, {diagnostics['deposition'].max():.3f} m max")
+            print(f"     ACTUAL surface lowering: {diagnostics['erosion'].mean():.3f} m avg, {diagnostics['erosion'].max():.3f} m max")
+            print(f"     ACTUAL surface raising: {diagnostics['deposition'].mean():.3f} m avg, {diagnostics['deposition'].max():.3f} m max")
+            print(f"     Net change range: {diagnostics['net_change'].min():.3f} to {diagnostics['net_change'].max():.3f} m")
     
     print(f"\n✓ SIMULATION COMPLETE!")
     print(f"   Total erosion simulated: {total_real_years:.0f} real years")
