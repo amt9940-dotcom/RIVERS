@@ -1,0 +1,196 @@
+================================================================================
+SIMPLE START GUIDE - WHICH FILES TO USE
+================================================================================
+
+QUESTION: Which files do I put into my code and what order?
+
+ANSWER: Just run ONE file. It handles everything.
+
+================================================================================
+
+
+STEP 1: Run This Command
+================================================================================
+
+cd /workspace
+python3 erosion_with_rivers_weather.py
+
+
+That's it! This file:
+- ✓ Imports from your "Rivers new" code
+- ✓ Uses YOUR weather system (not simplified)
+- ✓ Runs erosion simulation
+- ✓ Shows results
+
+
+================================================================================
+
+
+IF YOU WANT TO UNDERSTAND THE FILES:
+================================================================================
+
+Files You HAVE (already created):
+----------------------------------
+
+1. Rivers new                          [Your original code]
+   - Your terrain, weather, layers
+
+2. erosion_simulation.py               [Core engine - DON'T RUN DIRECTLY]
+   - Physics and algorithms
+   - Import this in your own scripts
+
+3. erosion_with_rivers_weather.py      [MAIN FILE - RUN THIS ONE]
+   - Connects Rivers new + erosion
+   - Uses YOUR full weather system
+
+
+Optional Files (for reference):
+--------------------------------
+
+4. example_erosion_simulation.py       [Standalone - uses fake weather]
+5. test_erosion.py                     [Quick test - 30 seconds]
+
+
+================================================================================
+
+
+WHICH FILE USES WHICH WEATHER?
+================================================================================
+
+                                    Weather System Used
+File                                Your Real Weather    Simplified/Fake
+--------------------------------------------------------------------------------
+erosion_with_rivers_weather.py           ✓✓✓✓✓               
+example_erosion_simulation.py                                   ✓✓✓✓✓
+integrated_erosion_example.py                                   ✓✓✓✓✓
+
+
+USE THIS ↑ for your real weather
+
+
+================================================================================
+
+
+FILE RELATIONSHIP DIAGRAM:
+================================================================================
+
+      YOUR CODE                  MY CODE
+      =========                  =======
+      
+   ┌─────────────┐          ┌──────────────────────┐
+   │ Rivers new  │─────────→│ erosion_with_rivers_ │ ← RUN THIS
+   │             │  imports │ weather.py           │
+   │ - terrain   │          │                      │
+   │ - weather   │          │ - coordinates both   │
+   │ - layers    │          └──────┬───────────────┘
+   └─────────────┘                 │
+                                   │ imports
+                                   ↓
+                          ┌─────────────────┐
+                          │ erosion_        │
+                          │ simulation.py   │
+                          │                 │
+                          │ - erosion       │
+                          │ - rivers        │
+                          │ - lakes         │
+                          └─────────────────┘
+
+
+================================================================================
+
+
+WHAT EACH FILE DOES:
+================================================================================
+
+Rivers new (yours)
+------------------
+- Generates quantum terrain
+- Creates geological layers
+- Generates sophisticated weather with storms
+- Computes orographic effects
+
+
+erosion_simulation.py (mine - library)
+--------------------------------------
+- Takes rainfall as input
+- Computes water flow
+- Erodes terrain based on rock type
+- Forms rivers and lakes
+- Visualizes results
+
+
+erosion_with_rivers_weather.py (mine - main script)
+---------------------------------------------------
+- Calls Rivers new to generate terrain
+- Calls Rivers new to generate weather
+- Calls erosion_simulation with that weather
+- Shows results
+
+This is the GLUE between your code and mine.
+
+
+================================================================================
+
+
+DO YOU NEED TO MODIFY YOUR "RIVERS NEW" CODE?
+================================================================================
+
+NO! Leave it exactly as it is.
+
+The erosion_with_rivers_weather.py script imports from it.
+
+
+================================================================================
+
+
+IMPORT ORDER (if writing your own script):
+================================================================================
+
+# Option A: Just run the provided script
+python3 erosion_with_rivers_weather.py
+
+
+# Option B: If writing your own Python script:
+
+from erosion_simulation import ErosionSimulation  # Import mine
+# ... import from Rivers new ...                  # Import yours
+
+terrain = quantum_seeded_topography(...)          # Use yours
+weather = generate_weather(...)                   # Use yours
+sim = ErosionSimulation(terrain, ...)             # Use mine
+sim.step(rainfall_map=weather)                    # Connect them
+
+
+================================================================================
+
+
+QUICK REFERENCE:
+================================================================================
+
+JUST WANT TO RUN IT?
+→ python3 erosion_with_rivers_weather.py
+
+WANT TO TEST INSTALLATION?
+→ python3 test_erosion.py
+
+WANT SIMPLE EXAMPLE?
+→ python3 example_erosion_simulation.py
+
+WANT TO WRITE YOUR OWN?
+→ See HOW_TO_USE.md
+
+
+================================================================================
+
+
+SUMMARY:
+================================================================================
+
+Main file:  erosion_with_rivers_weather.py
+Uses:       YOUR weather from "Rivers new"
+Command:    python3 erosion_with_rivers_weather.py
+Runtime:    5-15 minutes
+Output:     erosion_with_rivers_weather.png
+
+
+================================================================================

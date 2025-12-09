@@ -1,0 +1,169 @@
+╔════════════════════════════════════════════════════════════════════════════╗
+║                                                                            ║
+║                     WHICH FILE TO RUN - SIMPLE ANSWER                      ║
+║                                                                            ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+
+YOUR QUESTION:
+--------------
+"Which files do I put into my code and what order?"
+"Does this use my weather or create new weather?"
+
+
+ANSWER:
+-------
+
+    RUN THIS ONE FILE:
+    
+    ┌────────────────────────────────────────────────┐
+    │                                                │
+    │   python3 erosion_with_rivers_weather.py      │
+    │                                                │
+    │   ✓ Uses YOUR weather from "Rivers new"       │
+    │   ✓ Uses YOUR terrain generation              │
+    │   ✓ Uses YOUR layer system                    │
+    │   ✓ Adds erosion physics                      │
+    │                                                │
+    └────────────────────────────────────────────────┘
+
+
+EVEN SIMPLER:
+-------------
+
+    ./RUN_ME.sh
+
+    (This runs the same thing)
+
+
+═══════════════════════════════════════════════════════════════════════════
+
+
+WEATHER COMPARISON:
+-------------------
+
+    ┌──────────────────────────────────┬─────────────┬──────────────┐
+    │ File                             │ Your Weather│ Fake Weather │
+    ├──────────────────────────────────┼─────────────┼──────────────┤
+    │ erosion_with_rivers_weather.py   │     ✓✓✓     │              │ ← USE THIS
+    │ example_erosion_simulation.py    │             │      ✓✓✓     │
+    │ integrated_erosion_example.py    │             │      ✓✓✓     │
+    └──────────────────────────────────┴─────────────┴──────────────┘
+
+
+═══════════════════════════════════════════════════════════════════════════
+
+
+HOW IT WORKS:
+-------------
+
+    Your "Rivers new" Code              My Erosion Code
+    ══════════════════════              ═══════════════
+    
+    1. Generate terrain  ─────────────→  Receive terrain
+                                         
+    2. Generate layers   ─────────────→  Receive layers
+                                         
+    3. Generate storms   ─────────────→  Receive rainfall
+       with your weather                 
+       system            ─────────────→  Apply erosion
+                                         
+                         ←─────────────  Updated terrain
+                                         
+    4. Next year storms  ─────────────→  More erosion
+                                         
+                         ←─────────────  Rivers form
+                                         
+                         ←─────────────  Lakes form
+
+
+═══════════════════════════════════════════════════════════════════════════
+
+
+FILES YOU NEED (all already created):
+--------------------------------------
+
+    Required:
+    ---------
+    ✓ Rivers new                       (yours - already there)
+    ✓ erosion_simulation.py            (mine - physics engine)
+    ✓ erosion_with_rivers_weather.py   (mine - connects everything)
+    
+    Optional:
+    ---------
+    • example_erosion_simulation.py    (for testing without Rivers new)
+    • test_erosion.py                  (verify installation)
+
+
+═══════════════════════════════════════════════════════════════════════════
+
+
+WHAT YOU DON'T NEED TO CHANGE:
+-------------------------------
+
+    ✓ Rivers new           - Leave it as-is
+    ✓ Your existing code   - Don't modify anything
+    ✓ erosion_simulation.py - Don't modify
+
+
+═══════════════════════════════════════════════════════════════════════════
+
+
+STEP BY STEP:
+-------------
+
+    1. Open terminal
+    
+    2. cd /workspace
+    
+    3. python3 erosion_with_rivers_weather.py
+    
+    4. Wait 5-15 minutes
+    
+    5. Look at: erosion_with_rivers_weather.png
+
+
+═══════════════════════════════════════════════════════════════════════════
+
+
+CUSTOMIZATION (optional):
+--------------------------
+
+Edit erosion_with_rivers_weather.py at the bottom:
+
+    Change THIS:                       TO THIS:
+    ============                       ========
+    
+    n_years=50                    →    n_years=100      (longer simulation)
+    N=128                         →    N=256            (higher resolution)
+    base_wind_dir_deg=225.0       →    base_wind_dir_deg=90.0  (east wind)
+    random_seed=42                →    random_seed=123   (different terrain)
+
+
+═══════════════════════════════════════════════════════════════════════════
+
+
+SUMMARY:
+--------
+
+    COMMAND:    python3 erosion_with_rivers_weather.py
+    
+    USES:       YOUR weather from "Rivers new"
+                YOUR terrain generation
+                YOUR stratigraphy
+                MY erosion physics
+    
+    CREATES:    Rivers and lakes from realistic erosion
+    
+    OUTPUT:     erosion_with_rivers_weather.png
+    
+    TIME:       5-15 minutes
+
+
+═══════════════════════════════════════════════════════════════════════════
+
+
+THAT'S IT!
+
+One file. Uses your weather. Done.
+
