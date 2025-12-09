@@ -76,14 +76,23 @@ print(f"     - {n_windward} cells ({n_windward/N**2*100:.1f}%) are windward slop
 
 # Diagnostic info
 print(f"\n   Diagnostic info:")
-print(f"     Elevation range: {wind_structs['E_norm'].min():.3f} - {wind_structs['E_norm'].max():.3f}")
-print(f"     Slope range: {wind_structs['slope_norm'].min():.3f} - {wind_structs['slope_norm'].max():.3f}")
+print(f"     Elevation: {strata['surface_elev'].min():.1f} - {strata['surface_elev'].max():.1f} m")
+if "slope_mag" in wind_structs:
+    print(f"     Slope: {wind_structs['slope_mag'].min():.4f} - {wind_structs['slope_mag'].max():.4f} m/m")
+else:
+    print(f"     Slope (norm): {wind_structs['slope_norm'].min():.3f} - {wind_structs['slope_norm'].max():.3f}")
+
 if n_barriers > 0:
     barrier_elevs = strata["surface_elev"][wind_structs["barrier_mask"]]
-    print(f"     Barrier elevations: {barrier_elevs.min():.1f} - {barrier_elevs.max():.1f} m")
+    print(f"     Barriers at: {barrier_elevs.min():.1f} - {barrier_elevs.max():.1f} m (high ridges facing wind)")
+else:
+    print(f"     ⚠ No barriers detected - try adjusting thresholds")
+    
 if n_channels > 0:
     channel_elevs = strata["surface_elev"][wind_structs["channel_mask"]]
-    print(f"     Channel elevations: {channel_elevs.min():.1f} - {channel_elevs.max():.1f} m")
+    print(f"     Channels at: {channel_elevs.min():.1f} - {channel_elevs.max():.1f} m (low valleys aligned with wind)")
+else:
+    print(f"     ⚠ No channels detected - try adjusting thresholds")
 
 print(f"\n   These features will influence where storms form!")
 
@@ -96,12 +105,18 @@ im = ax.imshow(strata["surface_elev"], origin="lower", cmap="terrain")
 ax.set_title("Terrain Elevation", fontweight='bold', fontsize=11)
 plt.colorbar(im, ax=ax, label="Elevation (m)", fraction=0.046)
 
-# Slope map
+# Slope map (use actual slope magnitude in m/m if available)
 ax = axes[0, 1]
-slope_map = wind_structs["slope_norm"]
-im = ax.imshow(slope_map, origin="lower", cmap="YlOrRd")
-ax.set_title("Slope (steepness)", fontweight='bold', fontsize=11)
-plt.colorbar(im, ax=ax, label="Slope (0=flat, 1=steep)", fraction=0.046)
+if "slope_mag" in wind_structs:
+    slope_map = wind_structs["slope_mag"]
+    im = ax.imshow(slope_map, origin="lower", cmap="YlOrRd")
+    ax.set_title("Slope (steepness)", fontweight='bold', fontsize=11)
+    plt.colorbar(im, ax=ax, label="Slope (m/m)", fraction=0.046)
+else:
+    slope_map = wind_structs["slope_norm"]
+    im = ax.imshow(slope_map, origin="lower", cmap="YlOrRd")
+    ax.set_title("Slope (normalized)", fontweight='bold', fontsize=11)
+    plt.colorbar(im, ax=ax, label="Slope (0=flat, 1=steep)", fraction=0.046)
 
 # Elevation normalized
 ax = axes[0, 2]
@@ -357,27 +372,31 @@ print(f"   Rivers detected: {np.sum(rivers)} cells")
 # Main results figure
 fig2, axes = plt.subplots(2, 3, figsize=(16, 10))
 
-# Get proper elevation ranges for consistent colormaps
-elev_min = min(strata_initial["surface_elev"].min(), strata["surface_elev"].min())
-elev_max = max(strata_initial["surface_elev"].max(), strata["surface_elev"].max())
-
-# Before
+# Before - just show the data as-is
 ax = axes[0, 0]
-im = ax.imshow(strata_initial["surface_elev"], origin="lower", cmap="terrain",
-               vmin=elev_min, vmax=elev_max)
-ax.set_title("BEFORE: Elevation", fontweight='bold')
+im = ax.imshow(strata_initial["surface_elev"], origin="lower", cmap="terrain")
+ax.set_title("BEFORE: Elevation", fontweight='bold', fontsize=11)
 ax.set_xlabel("X (cells)")
 ax.set_ylabel("Y (cells)")
-plt.colorbar(im, ax=ax, label="Elevation (m)", fraction=0.046)
+cbar = plt.colorbar(im, ax=ax, label="Elevation (m)", fraction=0.046)
+elev_before_min = strata_initial["surface_elev"].min()
+elev_before_max = strata_initial["surface_elev"].max()
+ax.text(0.02, 0.98, f"Range: {elev_before_min:.0f}-{elev_before_max:.0f}m",
+        transform=ax.transAxes, fontsize=8, va='top',
+        bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
-# After - FIXED to show full map
+# After - show the evolved terrain
 ax = axes[0, 1]
-im = ax.imshow(strata["surface_elev"], origin="lower", cmap="terrain",
-               vmin=elev_min, vmax=elev_max)
-ax.set_title("AFTER: Elevation", fontweight='bold')
+im = ax.imshow(strata["surface_elev"], origin="lower", cmap="terrain")
+ax.set_title("AFTER: Elevation", fontweight='bold', fontsize=11)
 ax.set_xlabel("X (cells)")
 ax.set_ylabel("Y (cells)")
-plt.colorbar(im, ax=ax, label="Elevation (m)", fraction=0.046)
+cbar = plt.colorbar(im, ax=ax, label="Elevation (m)", fraction=0.046)
+elev_after_min = strata["surface_elev"].min()
+elev_after_max = strata["surface_elev"].max()
+ax.text(0.02, 0.98, f"Range: {elev_after_min:.0f}-{elev_after_max:.0f}m",
+        transform=ax.transAxes, fontsize=8, va='top',
+        bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
 # Change
 ax = axes[0, 2]

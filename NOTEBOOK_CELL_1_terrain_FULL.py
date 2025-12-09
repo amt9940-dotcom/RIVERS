@@ -151,29 +151,87 @@ def classify_windward_leeward(dEx, dEy, slope_norm, base_wind_dir_deg, slope_min
     
     return windward_mask, leeward_mask, up_component
 
-def classify_wind_barriers(E_norm, slope_n, lap, up_component,
-                            elev_thresh=0.55, slope_thresh=0.20, curv_thresh=-0.15):
-    """Identify mountain barriers that block wind."""
-    high = E_norm > elev_thresh
-    steep = slope_n > slope_thresh
-    convex = lap < curv_thresh
-    windward = up_component > 0.05
-    return high & steep & convex & windward
+def classify_wind_barriers(E, dEx, dEy, slope_mag, base_wind_dir_deg,
+                            local_high_window=15, slope_thresh=0.15, 
+                            aspect_tolerance=60):
+    """
+    Identify wind barriers: high, steep ridges that face INTO the wind.
+    
+    Criteria:
+    1. High compared to surroundings (ridge/mountain)
+    2. Steep slope
+    3. Downslope aspect points OPPOSITE to wind (steep face into wind)
+    """
+    ny, nx = E.shape
+    
+    # 1. Identify locally high points (ridges, peaks)
+    k = max(5, int(local_high_window) | 1)
+    E_smooth = _box_blur(E, k=k)
+    is_high = E > E_smooth  # Above local average = ridge
+    
+    # 2. Steep slopes
+    is_steep = slope_mag > slope_thresh
+    
+    # 3. Aspect check: downslope direction vs wind direction
+    # Wind direction: where wind COMES FROM
+    # Barrier: downslope aspect should be OPPOSITE to wind (±tolerance)
+    wind_rad = np.deg2rad(base_wind_dir_deg)
+    wind_dir_x = np.cos(wind_rad)
+    wind_dir_y = np.sin(wind_rad)
+    
+    # Downslope direction (gradient points uphill, so negate for downslope)
+    downslope_x = -dEx / (slope_mag + 1e-12)
+    downslope_y = -dEy / (slope_mag + 1e-12)
+    
+    # Dot product: if downslope is opposite to wind, dot product is negative
+    dot = downslope_x * wind_dir_x + downslope_y * wind_dir_y
+    faces_wind = dot < -np.cos(np.deg2rad(aspect_tolerance))  # Opposite direction
+    
+    # Combine: high AND steep AND faces wind
+    return is_high & is_steep & faces_wind
 
-def classify_wind_channels(E_norm, slope_n, lap, dEx, dEy, base_wind_dir_deg,
-                            elev_thresh=0.45, slope_thresh=0.25, curv_thresh=0.15):
-    """Identify valley channels that funnel wind."""
-    low = E_norm < elev_thresh
-    moderate_slope = (slope_n > 0.05) & (slope_n < slope_thresh)
-    concave = lap > curv_thresh
+def classify_wind_channels(E, slope_mag, lap, dEx, dEy, base_wind_dir_deg,
+                            local_low_window=15, slope_min=0.02, slope_max=0.30,
+                            curv_thresh=0.05, alignment_thresh=45):
+    """
+    Identify wind channels: low valleys aligned with wind direction.
     
-    theta = np.deg2rad(base_wind_dir_deg)
-    wx, wy = np.cos(theta), np.sin(theta)
-    grad_mag = np.sqrt(dEx**2 + dEy**2) + 1e-12
-    dot = (dEx * wx + dEy * wy) / grad_mag
-    aligned = np.abs(dot) > 0.3  # Less strict alignment
+    Criteria:
+    1. Low compared to surroundings (valley/gap)
+    2. Low-moderate slope
+    3. Concave curvature (valley shape)
+    4. Valley axis ALIGNED with wind direction
+    """
+    ny, nx = E.shape
     
-    return low & moderate_slope & concave & aligned
+    # 1. Identify locally low points (valleys, gaps)
+    k = max(5, int(local_low_window) | 1)
+    E_smooth = _box_blur(E, k=k)
+    is_low = E < E_smooth  # Below local average = valley
+    
+    # 2. Low to moderate slope (not flat, not super steep)
+    is_moderate_slope = (slope_mag > slope_min) & (slope_mag < slope_max)
+    
+    # 3. Concave curvature (valley shape)
+    is_concave = lap > curv_thresh  # Positive laplacian = concave
+    
+    # 4. Valley axis aligned with wind
+    # Wind direction: where wind GOES (or comes from)
+    wind_rad = np.deg2rad(base_wind_dir_deg)
+    wind_dir_x = np.cos(wind_rad)
+    wind_dir_y = np.sin(wind_rad)
+    
+    # Gradient direction (perpendicular to valley axis)
+    grad_norm_x = dEx / (slope_mag + 1e-12)
+    grad_norm_y = dEy / (slope_mag + 1e-12)
+    
+    # If valley runs parallel to wind, gradient should be perpendicular
+    # So dot product of gradient with wind should be near zero
+    dot = np.abs(grad_norm_x * wind_dir_x + grad_norm_y * wind_dir_y)
+    is_aligned = dot < np.sin(np.deg2rad(alignment_thresh))  # Gradient perpendicular = valley parallel
+    
+    # Combine: low AND moderate slope AND concave AND aligned
+    return is_low & is_moderate_slope & is_concave & is_aligned
 
 def classify_basins(E_norm, slope_n, lap, elev_thresh=0.40, slope_thresh=0.18, curv_thresh=0.12):
     """Identify basins/bowls where air pools."""
@@ -186,15 +244,16 @@ def classify_basins(E_norm, slope_n, lap, elev_thresh=0.40, slope_thresh=0.18, c
 def build_wind_structures(surface_elev, pixel_scale_m, base_wind_dir_deg):
     """
     Analyze terrain to find geological features that affect wind:
-    - Wind barriers (mountains)
-    - Wind channels (valleys)
-    - Basins (bowls)
+    - Wind barriers: high, steep ridges facing INTO wind
+    - Wind channels: low valleys ALIGNED with wind
+    - Basins: low bowls where air pools
     Returns masks and statistics.
     """
     topo = compute_topo_fields(surface_elev, pixel_scale_m)
     E = topo["E"]
     E_norm = topo["E_norm"]
     dEx, dEy = topo["dEx"], topo["dEy"]
+    slope_mag = topo["slope_mag"]
     slope_n = topo["slope_norm"]
     lap = topo["laplacian"]
     
@@ -202,14 +261,17 @@ def build_wind_structures(surface_elev, pixel_scale_m, base_wind_dir_deg):
         dEx, dEy, slope_n, base_wind_dir_deg
     )
     
-    barrier_mask = classify_wind_barriers(E_norm, slope_n, lap, up_component)
-    channel_mask = classify_wind_channels(E_norm, slope_n, lap, dEx, dEy, base_wind_dir_deg)
+    # Use proper classification criteria
+    barrier_mask = classify_wind_barriers(E, dEx, dEy, slope_mag, base_wind_dir_deg)
+    channel_mask = classify_wind_channels(E, slope_mag, lap, dEx, dEy, base_wind_dir_deg)
     basin_mask = classify_basins(E_norm, slope_n, lap)
     
     return {
         "E": E,
         "E_norm": E_norm,
+        "slope_mag": slope_mag,
         "slope_norm": slope_n,
+        "laplacian": lap,
         "windward_mask": windward_mask,
         "leeward_mask": leeward_mask,
         "barrier_mask": barrier_mask,
