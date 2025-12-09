@@ -73,38 +73,89 @@ print(f"     - {n_barriers} cells ({n_barriers/N**2*100:.1f}%) are wind barriers
 print(f"     - {n_channels} cells ({n_channels/N**2*100:.1f}%) are wind channels (valleys)")
 print(f"     - {n_basins} cells ({n_basins/N**2*100:.1f}%) are basins (bowls)")
 print(f"     - {n_windward} cells ({n_windward/N**2*100:.1f}%) are windward slopes")
-print(f"   These features will influence where storms form!")
 
-# Show wind structures
-fig0, axes = plt.subplots(2, 2, figsize=(12, 10))
+# Diagnostic info
+print(f"\n   Diagnostic info:")
+print(f"     Elevation range: {wind_structs['E_norm'].min():.3f} - {wind_structs['E_norm'].max():.3f}")
+print(f"     Slope range: {wind_structs['slope_norm'].min():.3f} - {wind_structs['slope_norm'].max():.3f}")
+if n_barriers > 0:
+    barrier_elevs = strata["surface_elev"][wind_structs["barrier_mask"]]
+    print(f"     Barrier elevations: {barrier_elevs.min():.1f} - {barrier_elevs.max():.1f} m")
+if n_channels > 0:
+    channel_elevs = strata["surface_elev"][wind_structs["channel_mask"]]
+    print(f"     Channel elevations: {channel_elevs.min():.1f} - {channel_elevs.max():.1f} m")
 
+print(f"\n   These features will influence where storms form!")
+
+# Show wind structures properly
+fig0, axes = plt.subplots(2, 3, figsize=(16, 10))
+
+# Original terrain
 ax = axes[0, 0]
 im = ax.imshow(strata["surface_elev"], origin="lower", cmap="terrain")
-ax.set_title("Terrain Elevation", fontweight='bold')
-plt.colorbar(im, ax=ax, label="Elevation (m)")
+ax.set_title("Terrain Elevation", fontweight='bold', fontsize=11)
+plt.colorbar(im, ax=ax, label="Elevation (m)", fraction=0.046)
 
+# Slope map
 ax = axes[0, 1]
-wind_composite = np.zeros_like(strata["surface_elev"])
-wind_composite[wind_structs["windward_mask"]] = 0.3
-wind_composite[wind_structs["barrier_mask"]] = 0.8
-wind_composite[wind_structs["channel_mask"]] = 0.5
-wind_composite[wind_structs["basin_mask"]] = 0.2
-im = ax.imshow(wind_composite, origin="lower", cmap="RdYlBu_r", vmin=0, vmax=1)
-ax.set_title(f"Wind Structures (wind from {base_wind_dir_deg}°)", fontweight='bold')
-cbar = plt.colorbar(im, ax=ax)
-cbar.set_label("Barrier(red) → Channel(yellow) → Basin(blue)")
+slope_map = wind_structs["slope_norm"]
+im = ax.imshow(slope_map, origin="lower", cmap="YlOrRd")
+ax.set_title("Slope (steepness)", fontweight='bold', fontsize=11)
+plt.colorbar(im, ax=ax, label="Slope (0=flat, 1=steep)", fraction=0.046)
 
+# Elevation normalized
+ax = axes[0, 2]
+im = ax.imshow(wind_structs["E_norm"], origin="lower", cmap="terrain")
+ax.set_title("Normalized Elevation", fontweight='bold', fontsize=11)
+plt.colorbar(im, ax=ax, label="0 (low) to 1 (high)", fraction=0.046)
+
+# Wind barriers (mountains) - show on terrain background
 ax = axes[1, 0]
-im = ax.imshow(wind_structs["barrier_mask"].astype(float), origin="lower", cmap="Reds")
-ax.set_title("Wind Barriers (Mountains)", fontweight='bold')
-plt.colorbar(im, ax=ax)
+im = ax.imshow(strata["surface_elev"], origin="lower", cmap="gray", alpha=0.3)
+barrier_overlay = np.ma.masked_where(~wind_structs["barrier_mask"], 
+                                      strata["surface_elev"])
+im2 = ax.imshow(barrier_overlay, origin="lower", cmap="Reds", alpha=0.8)
+ax.set_title(f"Wind Barriers (n={n_barriers})", fontweight='bold', fontsize=11)
+ax.text(0.02, 0.98, "Mountains that block wind", transform=ax.transAxes,
+        fontsize=9, va='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+plt.colorbar(im2, ax=ax, label="Barrier elevation (m)", fraction=0.046)
 
+# Wind channels (valleys) - show on terrain background
 ax = axes[1, 1]
-im = ax.imshow(wind_structs["channel_mask"].astype(float), origin="lower", cmap="Blues")
-ax.set_title("Wind Channels (Valleys)", fontweight='bold')
-plt.colorbar(im, ax=ax)
+im = ax.imshow(strata["surface_elev"], origin="lower", cmap="gray", alpha=0.3)
+channel_overlay = np.ma.masked_where(~wind_structs["channel_mask"], 
+                                       strata["surface_elev"])
+im2 = ax.imshow(channel_overlay, origin="lower", cmap="Blues", alpha=0.8)
+ax.set_title(f"Wind Channels (n={n_channels})", fontweight='bold', fontsize=11)
+ax.text(0.02, 0.98, "Valleys that funnel wind", transform=ax.transAxes,
+        fontsize=9, va='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+plt.colorbar(im2, ax=ax, label="Channel elevation (m)", fraction=0.046)
 
-plt.suptitle("Terrain Analysis for Wind/Storm Routing", fontsize=14, fontweight='bold')
+# Combined map showing all features
+ax = axes[1, 2]
+im = ax.imshow(strata["surface_elev"], origin="lower", cmap="terrain", alpha=0.7)
+# Overlay barriers in red contours
+if n_barriers > 0:
+    barrier_contours = wind_structs["barrier_mask"].astype(float)
+    ax.contour(barrier_contours, levels=[0.5], colors='red', linewidths=2, 
+               linestyles='solid', alpha=0.8)
+# Overlay channels in blue contours
+if n_channels > 0:
+    channel_contours = wind_structs["channel_mask"].astype(float)
+    ax.contour(channel_contours, levels=[0.5], colors='blue', linewidths=2,
+               linestyles='dashed', alpha=0.8)
+# Show windward slopes in light overlay
+windward_overlay = np.ma.masked_where(~wind_structs["windward_mask"], 
+                                       np.ones_like(strata["surface_elev"]))
+ax.imshow(windward_overlay, origin="lower", cmap="Oranges", alpha=0.2, vmin=0, vmax=1)
+ax.set_title(f"Combined: Terrain + Features", fontweight='bold', fontsize=11)
+ax.text(0.02, 0.98, "Red=Barriers, Blue=Channels, Orange=Windward", 
+        transform=ax.transAxes, fontsize=8, va='top', 
+        bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
+plt.colorbar(im, ax=ax, label="Elevation (m)", fraction=0.046)
+
+plt.suptitle(f"Terrain Analysis for Wind/Storm Routing (Wind from {base_wind_dir_deg}°)", 
+             fontsize=13, fontweight='bold')
 plt.tight_layout()
 plt.show()
 
@@ -306,24 +357,42 @@ print(f"   Rivers detected: {np.sum(rivers)} cells")
 # Main results figure
 fig2, axes = plt.subplots(2, 3, figsize=(16, 10))
 
+# Get proper elevation ranges for consistent colormaps
+elev_min = min(strata_initial["surface_elev"].min(), strata["surface_elev"].min())
+elev_max = max(strata_initial["surface_elev"].max(), strata["surface_elev"].max())
+
 # Before
 ax = axes[0, 0]
-im = ax.imshow(strata_initial["surface_elev"], origin="lower", cmap="terrain")
+im = ax.imshow(strata_initial["surface_elev"], origin="lower", cmap="terrain",
+               vmin=elev_min, vmax=elev_max)
 ax.set_title("BEFORE: Elevation", fontweight='bold')
-plt.colorbar(im, ax=ax, fraction=0.046)
+ax.set_xlabel("X (cells)")
+ax.set_ylabel("Y (cells)")
+plt.colorbar(im, ax=ax, label="Elevation (m)", fraction=0.046)
 
-# After
+# After - FIXED to show full map
 ax = axes[0, 1]
-im = ax.imshow(strata["surface_elev"], origin="lower", cmap="terrain")
+im = ax.imshow(strata["surface_elev"], origin="lower", cmap="terrain",
+               vmin=elev_min, vmax=elev_max)
 ax.set_title("AFTER: Elevation", fontweight='bold')
-plt.colorbar(im, ax=ax, fraction=0.046)
+ax.set_xlabel("X (cells)")
+ax.set_ylabel("Y (cells)")
+plt.colorbar(im, ax=ax, label="Elevation (m)", fraction=0.046)
 
 # Change
 ax = axes[0, 2]
 vmax = max(abs(delta_elev.min()), abs(delta_elev.max()))
-im = ax.imshow(delta_elev, origin="lower", cmap="RdBu_r", vmin=-vmax, vmax=vmax)
-ax.set_title("Elevation Change (Δz)", fontweight='bold')
-plt.colorbar(im, ax=ax, label="Δz (m)", fraction=0.046)
+if vmax < 0.01:  # If change is tiny, use absolute values
+    im = ax.imshow(np.abs(delta_elev), origin="lower", cmap="Reds")
+    ax.set_title("Elevation Change (|Δz|)", fontweight='bold')
+    cbar_label = "|Δz| (m)"
+else:
+    im = ax.imshow(delta_elev, origin="lower", cmap="RdBu_r", vmin=-vmax, vmax=vmax)
+    ax.set_title("Elevation Change (Δz)", fontweight='bold')
+    cbar_label = "Δz (m): erosion(red) / deposition(blue)"
+ax.set_xlabel("X (cells)")
+ax.set_ylabel("Y (cells)")
+plt.colorbar(im, ax=ax, label=cbar_label, fraction=0.046)
 
 # Total erosion
 ax = axes[1, 0]

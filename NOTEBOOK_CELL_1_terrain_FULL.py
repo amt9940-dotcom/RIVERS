@@ -152,30 +152,30 @@ def classify_windward_leeward(dEx, dEy, slope_norm, base_wind_dir_deg, slope_min
     return windward_mask, leeward_mask, up_component
 
 def classify_wind_barriers(E_norm, slope_n, lap, up_component,
-                            elev_thresh=0.6, slope_thresh=0.25, curv_thresh=-0.3):
+                            elev_thresh=0.55, slope_thresh=0.20, curv_thresh=-0.15):
     """Identify mountain barriers that block wind."""
     high = E_norm > elev_thresh
     steep = slope_n > slope_thresh
     convex = lap < curv_thresh
-    windward = up_component > 0.1
+    windward = up_component > 0.05
     return high & steep & convex & windward
 
 def classify_wind_channels(E_norm, slope_n, lap, dEx, dEy, base_wind_dir_deg,
-                            elev_thresh=0.4, slope_thresh=0.2, curv_thresh=0.3):
+                            elev_thresh=0.45, slope_thresh=0.25, curv_thresh=0.15):
     """Identify valley channels that funnel wind."""
     low = E_norm < elev_thresh
-    moderate_slope = (slope_n > 0.1) & (slope_n < slope_thresh)
+    moderate_slope = (slope_n > 0.05) & (slope_n < slope_thresh)
     concave = lap > curv_thresh
     
     theta = np.deg2rad(base_wind_dir_deg)
     wx, wy = np.cos(theta), np.sin(theta)
     grad_mag = np.sqrt(dEx**2 + dEy**2) + 1e-12
     dot = (dEx * wx + dEy * wy) / grad_mag
-    aligned = np.abs(dot) > 0.5
+    aligned = np.abs(dot) > 0.3  # Less strict alignment
     
     return low & moderate_slope & concave & aligned
 
-def classify_basins(E_norm, slope_n, lap, elev_thresh=0.35, slope_thresh=0.15, curv_thresh=0.2):
+def classify_basins(E_norm, slope_n, lap, elev_thresh=0.40, slope_thresh=0.18, curv_thresh=0.12):
     """Identify basins/bowls where air pools."""
     low = E_norm < elev_thresh
     flat = slope_n < slope_thresh
