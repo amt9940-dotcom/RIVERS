@@ -785,3 +785,5 @@ print("    - run_erosion_epoch(): run one time step")
 print("    - run_erosion_simulation(): run multiple time steps")
 print("    - plot_erosion_evolution(): visualize results")
 print("    - plot_cross_section_evolution(): show layer changes")
+
+print("✓ Erosion model loaded!")
