@@ -516,3 +516,223 @@ def plot_time_series(
         print(f"Saved to {save_path}")
     
     plt.show()
+
+
+def plot_erosion_analysis(
+    erosion: np.ndarray,
+    surface_elev: np.ndarray,
+    pixel_scale_m: float,
+    row_for_profile: Optional[int] = None,
+    figsize: Tuple[float, float] = (16, 10),
+    cmap: str = 'Reds',
+    save_path: Optional[str] = None
+):
+    """
+    Comprehensive erosion analysis plot.
+    
+    Shows:
+    - Erosion map
+    - Erosion histogram
+    - Erosion profile (cross-section)
+    - Erosion vs elevation scatter
+    
+    Parameters
+    ----------
+    erosion : np.ndarray
+        Cumulative erosion depth (m), positive values = material removed
+    surface_elev : np.ndarray
+        Current surface elevation (m)
+    pixel_scale_m : float
+        Grid spacing (m)
+    row_for_profile : int, optional
+        Row index for profile. If None, uses middle row.
+    figsize : tuple
+        Figure size
+    cmap : str
+        Colormap for erosion map
+    save_path : str, optional
+        If provided, save figure to this path
+    """
+    if row_for_profile is None:
+        row_for_profile = erosion.shape[0] // 2
+    
+    # Create figure with custom layout
+    fig = plt.figure(figsize=figsize)
+    gs = GridSpec(3, 2, figure=fig, hspace=0.3, wspace=0.3)
+    
+    # Convert to km for display
+    extent_km = [0, erosion.shape[1] * pixel_scale_m / 1000,
+                 0, erosion.shape[0] * pixel_scale_m / 1000]
+    
+    # 1. Erosion map (large, top)
+    ax1 = fig.add_subplot(gs[0:2, 0])
+    im1 = ax1.imshow(erosion, cmap=cmap, extent=extent_km, origin='lower')
+    ax1.set_title('Cumulative Erosion Map', fontsize=14, fontweight='bold')
+    ax1.set_xlabel('X (km)')
+    ax1.set_ylabel('Y (km)')
+    
+    # Mark profile location
+    profile_y_km = row_for_profile * pixel_scale_m / 1000
+    ax1.axhline(profile_y_km, color='cyan', linestyle='--', linewidth=2, 
+                label=f'Profile at y={profile_y_km:.1f} km')
+    ax1.legend(loc='upper right')
+    
+    cbar1 = plt.colorbar(im1, ax=ax1, label='Erosion Depth (m)')
+    
+    # Add statistics text
+    stats_text = (
+        f"Total eroded: {erosion.sum():.1f} m\n"
+        f"Mean: {erosion.mean():.2f} m\n"
+        f"Max: {erosion.max():.2f} m\n"
+        f"Std: {erosion.std():.2f} m"
+    )
+    ax1.text(0.02, 0.98, stats_text, transform=ax1.transAxes,
+             fontsize=10, verticalalignment='top',
+             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    # 2. Erosion histogram
+    ax2 = fig.add_subplot(gs[0, 1])
+    erosion_values = erosion[erosion > 0]  # Only where erosion occurred
+    if len(erosion_values) > 0:
+        ax2.hist(erosion_values, bins=50, color='darkred', alpha=0.7, edgecolor='black')
+        ax2.axvline(erosion_values.mean(), color='blue', linestyle='--', 
+                   linewidth=2, label=f'Mean: {erosion_values.mean():.2f} m')
+        ax2.axvline(np.median(erosion_values), color='green', linestyle='--',
+                   linewidth=2, label=f'Median: {np.median(erosion_values):.2f} m')
+        ax2.set_xlabel('Erosion Depth (m)')
+        ax2.set_ylabel('Frequency')
+        ax2.set_title('Erosion Distribution')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+    else:
+        ax2.text(0.5, 0.5, 'No erosion data', ha='center', va='center',
+                transform=ax2.transAxes, fontsize=12)
+    
+    # 3. Erosion profile (cross-section)
+    ax3 = fig.add_subplot(gs[1, 1])
+    x_coords = np.arange(erosion.shape[1]) * pixel_scale_m / 1000
+    erosion_profile = erosion[row_for_profile, :]
+    
+    ax3.fill_between(x_coords, 0, erosion_profile, color='darkred', alpha=0.5)
+    ax3.plot(x_coords, erosion_profile, 'r-', linewidth=2)
+    ax3.set_xlabel('Distance (km)')
+    ax3.set_ylabel('Erosion Depth (m)')
+    ax3.set_title(f'Erosion Profile (Row {row_for_profile})')
+    ax3.grid(True, alpha=0.3)
+    ax3.set_ylim(bottom=0)
+    
+    # 4. Erosion vs elevation scatter
+    ax4 = fig.add_subplot(gs[2, :])
+    
+    # Sample points for scatter (avoid too many points)
+    ny, nx = erosion.shape
+    sample_step = max(1, ny // 50)  # Sample ~2500 points max
+    
+    erosion_sample = erosion[::sample_step, ::sample_step].flatten()
+    elev_sample = surface_elev[::sample_step, ::sample_step].flatten()
+    
+    # Only plot where erosion occurred
+    mask = erosion_sample > 0
+    if mask.sum() > 0:
+        scatter = ax4.scatter(elev_sample[mask], erosion_sample[mask],
+                            c=erosion_sample[mask], cmap=cmap,
+                            alpha=0.5, s=10, edgecolors='none')
+        ax4.set_xlabel('Current Elevation (m)')
+        ax4.set_ylabel('Erosion Depth (m)')
+        ax4.set_title('Erosion vs Elevation')
+        ax4.grid(True, alpha=0.3)
+        plt.colorbar(scatter, ax=ax4, label='Erosion (m)')
+        
+        # Add trend line
+        from scipy.stats import linregress
+        slope, intercept, r_value, p_value, std_err = linregress(
+            elev_sample[mask], erosion_sample[mask]
+        )
+        trend_x = np.array([elev_sample[mask].min(), elev_sample[mask].max()])
+        trend_y = slope * trend_x + intercept
+        ax4.plot(trend_x, trend_y, 'b--', linewidth=2, 
+                label=f'Trend (R²={r_value**2:.3f})')
+        ax4.legend()
+    else:
+        ax4.text(0.5, 0.5, 'No erosion data', ha='center', va='center',
+                transform=ax4.transAxes, fontsize=12)
+    
+    plt.suptitle('Erosion Analysis', fontsize=16, fontweight='bold', y=0.995)
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved to {save_path}")
+    
+    plt.show()
+
+
+def plot_erosion_rate_map(
+    erosion_rate: np.ndarray,
+    pixel_scale_m: float,
+    flow_accum: Optional[np.ndarray] = None,
+    figsize: Tuple[float, float] = (14, 6),
+    cmap: str = 'hot_r',
+    save_path: Optional[str] = None
+):
+    """
+    Plot erosion rate map, optionally with river network overlay.
+    
+    Parameters
+    ----------
+    erosion_rate : np.ndarray
+        Erosion rate (m/yr)
+    pixel_scale_m : float
+        Grid spacing (m)
+    flow_accum : np.ndarray, optional
+        Flow accumulation for river overlay
+    figsize : tuple
+        Figure size
+    cmap : str
+        Colormap
+    save_path : str, optional
+        If provided, save figure to this path
+    """
+    extent_km = [0, erosion_rate.shape[1] * pixel_scale_m / 1000,
+                 0, erosion_rate.shape[0] * pixel_scale_m / 1000]
+    
+    if flow_accum is not None:
+        # Two panels: erosion rate and erosion + rivers
+        fig, axes = plt.subplots(1, 2, figsize=figsize)
+        
+        # Left: erosion rate only
+        im1 = axes[0].imshow(erosion_rate, cmap=cmap, extent=extent_km, origin='lower')
+        axes[0].set_title('Erosion Rate')
+        axes[0].set_xlabel('X (km)')
+        axes[0].set_ylabel('Y (km)')
+        plt.colorbar(im1, ax=axes[0], label='Erosion Rate (m/yr)')
+        
+        # Right: erosion rate with rivers
+        im2 = axes[1].imshow(erosion_rate, cmap=cmap, extent=extent_km, origin='lower')
+        
+        # Overlay rivers
+        threshold = np.percentile(flow_accum, 95)
+        rivers = flow_accum >= threshold
+        river_overlay = np.ma.masked_where(~rivers, flow_accum)
+        axes[1].imshow(river_overlay, cmap='Blues', alpha=0.5, 
+                      extent=extent_km, origin='lower')
+        
+        axes[1].set_title('Erosion Rate + River Network')
+        axes[1].set_xlabel('X (km)')
+        plt.colorbar(im2, ax=axes[1], label='Erosion Rate (m/yr)')
+        
+    else:
+        # Single panel
+        fig, ax = plt.subplots(figsize=(10, 8))
+        im = ax.imshow(erosion_rate, cmap=cmap, extent=extent_km, origin='lower')
+        ax.set_title('Erosion Rate')
+        ax.set_xlabel('X (km)')
+        ax.set_ylabel('Y (km)')
+        plt.colorbar(im, ax=ax, label='Erosion Rate (m/yr)')
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved to {save_path}")
+    
+    plt.show()

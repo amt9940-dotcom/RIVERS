@@ -36,6 +36,10 @@ from .simulator import (
     SimulationHistory,
     create_simple_simulator
 )
+from .visualization import (
+    plot_erosion_analysis,
+    plot_erosion_rate_map
+)
 
 __all__ = [
     # World state
@@ -70,4 +74,8 @@ __all__ = [
     'LandscapeEvolutionSimulator',
     'SimulationHistory',
     'create_simple_simulator',
+    
+    # Visualization
+    'plot_erosion_analysis',
+    'plot_erosion_rate_map',
 ]
