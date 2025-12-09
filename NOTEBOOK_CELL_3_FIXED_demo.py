@@ -27,8 +27,21 @@ base_elevation_m = 800.0
 relief_m = 400.0
 base_wind_dir_deg = 270.0  # West to East
 
-# Generate
-z_norm, rng = quantum_seeded_topography(N=N, random_seed=seed, scale=3.0, octaves=6)
+# Generate terrain
+# Check which version of quantum_seeded_topography we have
+import inspect
+sig = inspect.signature(quantum_seeded_topography)
+params = list(sig.parameters.keys())
+
+if 'scale' in params and 'octaves' in params:
+    # New FIXED version
+    z_norm, rng = quantum_seeded_topography(N=N, random_seed=seed, scale=3.0, octaves=6)
+elif 'beta' in params:
+    # Old version
+    z_norm, rng = quantum_seeded_topography(N=N, random_seed=seed, beta=3.0)
+else:
+    # Try new signature as default
+    z_norm, rng = quantum_seeded_topography(N=N, random_seed=seed, scale=3.0, octaves=6)
 strata = generate_stratigraphy(z_norm, pixel_scale_m, base_elevation_m, relief_m)
 
 print(f"   Grid: {N} × {N}")
