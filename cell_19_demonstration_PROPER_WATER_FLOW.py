@@ -160,12 +160,17 @@ def simulate_water_flow(height, rain_amount=1.0, steps=200, flow_factor=0.5):
     -------
     water : np.ndarray (ny, nx)
         Water depth at each cell after flow [m]
+    flux : np.ndarray (ny, nx)
+        Cumulative water flow through each cell [m]
     """
     height = height.astype(np.float64)
     rows, cols = height.shape
     
     # Initialize water depth (uniform rainfall)
     water = np.full_like(height, rain_amount, dtype=np.float64)
+    
+    # Track cumulative flux (total water that flowed OUT of each cell)
+    flux = np.zeros_like(water, dtype=np.float64)
     
     print(f"  Starting water flow simulation...")
     print(f"    Initial rain: {rain_amount:.3f} m per cell")
@@ -205,6 +210,8 @@ def simulate_water_flow(height, rain_amount=1.0, steps=200, flow_factor=0.5):
                 if outflow > 0:
                     dwater[i, j] -= outflow
                     dwater[lowest_pos] += outflow
+                    # TRACK FLUX: accumulate total water that flowed through this cell
+                    flux[i, j] += outflow
         
         water += dwater
         
@@ -215,59 +222,14 @@ def simulate_water_flow(height, rain_amount=1.0, steps=200, flow_factor=0.5):
     print(f"  ✓ Water flow complete")
     print(f"    Final max depth: {water.max():.3f} m")
     print(f"    Final mean depth: {water.mean():.3f} m")
+    print(f"    Total flux (max): {flux.max():.3f} m")
     
-    return water
+    return water, flux
 
 
-def classify_water_cells(height, water, min_depth=0.01):
-    """
-    Classify water cells into lakes vs rivers.
-    
-    Parameters
-    ----------
-    height : np.ndarray (ny, nx)
-        Terrain elevation [m]
-    water : np.ndarray (ny, nx)
-        Water depth [m]
-    min_depth : float
-        Minimum depth to consider as water [m]
-    
-    Returns
-    -------
-    lakes : np.ndarray (ny, nx), bool
-        True where lakes exist (water with no downhill outlet)
-    rivers : np.ndarray (ny, nx), bool
-        True where rivers exist (water with downhill outlet)
-    """
-    height = height.astype(np.float64)
-    surface = height + water
-    rows, cols = surface.shape
-    
-    lakes = np.zeros_like(surface, dtype=bool)
-    rivers = np.zeros_like(surface, dtype=bool)
-    
-    for i in range(rows):
-        for j in range(cols):
-            if water[i, j] < min_depth:
-                continue
-            
-            current_surface = surface[i, j]
-            has_downhill = False
-            
-            # Check if any neighbor is lower
-            for di, dj in NEIGHBOR_OFFSETS:
-                ni, nj = i + di, j + dj
-                if 0 <= ni < rows and 0 <= nj < cols:
-                    if surface[ni, nj] < current_surface - 1e-9:
-                        has_downhill = True
-                        break
-            
-            if has_downhill:
-                rivers[i, j] = True
-            else:
-                lakes[i, j] = True
-    
-    return lakes, rivers
+# Water classification now based on:
+# - ALL_LAKES = all settled water (where water ends up)
+# - RIVERS = water in motion (based on flux through cells)
 
 
 # Run water flow simulation on final terrain
@@ -275,7 +237,7 @@ print("\nFreezing terrain at final elevation...")
 elevation_final = epoch_elevations[-1].copy()
 
 print("Applying rainfall and simulating flow...")
-water_depth = simulate_water_flow(
+water_depth, flux = simulate_water_flow(
     height=elevation_final,
     rain_amount=1.0,      # 1 meter of rain
     steps=300,            # 300 flow iterations
@@ -283,20 +245,28 @@ water_depth = simulate_water_flow(
 )
 
 print("\nClassifying water features...")
-lakes_mask, rivers_mask = classify_water_cells(
-    height=elevation_final,
-    water=water_depth,
-    min_depth=0.02  # Only show water > 2cm deep
-)
 
-num_river_cells = np.sum(rivers_mask)
-num_lake_cells = np.sum(lakes_mask)
+# TUNABLE THRESHOLDS
+min_water_depth = 0.02  # Minimum depth to count as water (m)
+river_flux_threshold = 5.0  # Minimum flux to count as river (m total flow)
+
 ny, nx = elevation_final.shape
 
+# ALL LAKES = all settled water (anywhere water ended up)
+water_mask = water_depth > min_water_depth
+all_lakes_mask = water_mask  # All water that settled is "lake"
+
+# RIVERS = water in motion (cells with significant flow)
+rivers_mask = (flux > river_flux_threshold) & water_mask
+
+num_lake_cells = np.sum(all_lakes_mask)
+num_river_cells = np.sum(rivers_mask)
+
 print(f"✓ Water classification complete:")
-print(f"  River cells: {num_river_cells} ({100*num_river_cells/(ny*nx):.2f}%)")
-print(f"  Lake cells: {num_lake_cells} ({100*num_lake_cells/(ny*nx):.2f}%)")
-print(f"  Total water cells: {num_river_cells + num_lake_cells} ({100*(num_river_cells + num_lake_cells)/(ny*nx):.2f}%)")
+print(f"  Lakes (all settled water): {num_lake_cells} ({100*num_lake_cells/(ny*nx):.2f}%)")
+print(f"  Rivers (flow-based): {num_river_cells} ({100*num_river_cells/(ny*nx):.2f}%)")
+print(f"  River flux threshold: {river_flux_threshold} m")
+print(f"  Max flux: {flux.max():.2f} m")
 
 print("\n" + "="*80)
 print("✅ WATER FLOW SIMULATION COMPLETE")
@@ -401,27 +371,27 @@ ax1.axis('off')
 plt.colorbar(im1, ax=ax1, label='Elevation (m)', fraction=0.046)
 
 # Plot 2: Water depth (all water)
-water_to_show = np.where(water_depth > 0.02, water_depth, np.nan)
+water_to_show = np.where(water_depth > min_water_depth, water_depth, np.nan)
 im2 = ax2.imshow(water_to_show, cmap='Blues', origin='lower')
 ax2.set_title("Water Depth (All Water)", fontsize=14, fontweight='bold')
 ax2.axis('off')
 plt.colorbar(im2, ax=ax2, label='Depth (m)', fraction=0.046)
 
-# Plot 3: Rivers only
-rivers_depth = np.where(rivers_mask, water_depth, np.nan)
-im3 = ax3.imshow(rivers_depth, cmap='Blues', origin='lower')
-ax3.set_title("Rivers Only", fontsize=14, fontweight='bold')
+# Plot 3: Rivers only (FLOW MAP - based on flux)
+rivers_flow = np.where(rivers_mask, flux, np.nan)
+im3 = ax3.imshow(rivers_flow, cmap='Blues', origin='lower')
+ax3.set_title("Rivers Only (Flow Map)", fontsize=14, fontweight='bold')
 ax3.axis('off')
-plt.colorbar(im3, ax=ax3, label='Depth (m)', fraction=0.046)
+plt.colorbar(im3, ax=ax3, label='Cumulative Flow (m)', fraction=0.046)
 
-# Plot 4: Lakes only
-lakes_depth = np.where(lakes_mask, water_depth, np.nan)
+# Plot 4: Lakes only (ALL SETTLED WATER)
+lakes_depth = np.where(all_lakes_mask, water_depth, np.nan)
 im4 = ax4.imshow(lakes_depth, cmap='Blues', origin='lower')
-ax4.set_title("Lakes Only", fontsize=14, fontweight='bold')
+ax4.set_title("Lakes Only (All Settled Water)", fontsize=14, fontweight='bold')
 ax4.axis('off')
 plt.colorbar(im4, ax=ax4, label='Depth (m)', fraction=0.046)
 
-# Plot 5: **MAIN VISUALIZATION** - Terrain with water overlay (NO BLUE HUE!)
+# Plot 5: **MAIN VISUALIZATION** - Terrain with water overlay
 terrain_rgb = plt.cm.terrain((elevation_final - elevation_final.min()) / 
                              (elevation_final.max() - elevation_final.min() + 1e-9))[:, :, :3]
 
@@ -429,30 +399,30 @@ terrain_rgb = plt.cm.terrain((elevation_final - elevation_final.min()) /
 water_overlay = np.zeros((ny, nx, 4))  # RGBA
 water_overlay[:, :, 3] = 0.0  # Transparent everywhere by default
 
-# Rivers: bright blue, semi-transparent
-water_overlay[rivers_mask, 0] = 0.0  # R
-water_overlay[rivers_mask, 1] = 0.4  # G
-water_overlay[rivers_mask, 2] = 1.0  # B (bright blue)
-water_overlay[rivers_mask, 3] = 0.7  # Alpha
+# Lakes: cyan, more opaque (draw first, so rivers overlay on top)
+water_overlay[all_lakes_mask, 0] = 0.0  # R
+water_overlay[all_lakes_mask, 1] = 0.7  # G
+water_overlay[all_lakes_mask, 2] = 1.0  # B
+water_overlay[all_lakes_mask, 3] = 0.7  # Alpha
 
-# Lakes: cyan, more opaque
-water_overlay[lakes_mask, 0] = 0.0  # R
-water_overlay[lakes_mask, 1] = 0.7  # G
-water_overlay[lakes_mask, 2] = 1.0  # B
-water_overlay[lakes_mask, 3] = 0.85  # Alpha
+# Rivers: bright blue, semi-transparent (draw on top of lakes)
+water_overlay[rivers_mask, 0] = 0.0  # R
+water_overlay[rivers_mask, 1] = 0.3  # G (darker blue for rivers)
+water_overlay[rivers_mask, 2] = 1.0  # B (bright blue)
+water_overlay[rivers_mask, 3] = 0.85  # Alpha (more opaque)
 
 # Composite - terrain stays as-is, only water cells get blue
 ax5.imshow(terrain_rgb, origin='lower')
 ax5.imshow(water_overlay, origin='lower')
-ax5.set_title("🌊 TERRAIN + RIVERS + LAKES 🌊\n(Proper Water Flow - No Blue Hue!)", 
+ax5.set_title("🌊 TERRAIN + RIVERS + LAKES 🌊\n(Lakes = Settled Water, Rivers = Flow)", 
               fontsize=14, fontweight='bold', color='blue')
 ax5.axis('off')
 
 # Add legend
 from matplotlib.patches import Patch
 legend_elements = [
-    Patch(facecolor='blue', alpha=0.7, label=f'Rivers ({num_river_cells} cells)'),
-    Patch(facecolor='cyan', alpha=0.85, label=f'Lakes ({num_lake_cells} cells)')
+    Patch(facecolor='cyan', alpha=0.7, label=f'Lakes ({num_lake_cells} cells)'),
+    Patch(facecolor='blue', alpha=0.85, label=f'Rivers ({num_river_cells} cells)')
 ]
 ax5.legend(handles=legend_elements, loc='upper right', fontsize=10)
 
@@ -460,6 +430,7 @@ ax5.legend(handles=legend_elements, loc='upper right', fontsize=10)
 erosion_final = initial_elev - elevation_final
 erosion_rgb = plt.cm.hot_r(erosion_final / (erosion_final.max() + 1e-9))[:, :, :3]
 
+# Use same water overlay (lakes + rivers)
 ax6.imshow(erosion_rgb, origin='lower')
 ax6.imshow(water_overlay, origin='lower')
 ax6.set_title("Erosion Depth + Water", fontsize=14, fontweight='bold')
@@ -488,7 +459,7 @@ x_coords = np.arange(nx) * pixel_scale_m
 ax1.fill_between(x_coords, 0, elevation_final[mid_row, :], 
                  color='saddlebrown', alpha=0.7, label='Terrain')
 water_surface = elevation_final[mid_row, :] + water_depth[mid_row, :]
-water_exists = water_depth[mid_row, :] > 0.02
+water_exists = water_depth[mid_row, :] > min_water_depth
 ax1.fill_between(x_coords, elevation_final[mid_row, :], water_surface, 
                  where=water_exists,
                  color='cyan', alpha=0.6, label='Water')
@@ -498,24 +469,24 @@ ax1.set_title(f"Cross-Section at Row {mid_row} (with Water)", fontsize=14, fontw
 ax1.legend(loc='upper right')
 ax1.grid(True, alpha=0.3)
 
-# Plot 2: Water depth profile
-ax2.plot(x_coords, water_depth[mid_row, :], 'b-', linewidth=2, label='Water Depth')
+# Plot 2: Water depth and flux profile
+ax2_twin = ax2.twinx()
+ax2.plot(x_coords, water_depth[mid_row, :], 'c-', linewidth=2, label='Water Depth', alpha=0.7)
+ax2_twin.plot(x_coords, flux[mid_row, :], 'b-', linewidth=2, label='Flow (Flux)', alpha=0.7)
 ax2.set_xlabel("Distance (m)", fontsize=12)
-ax2.set_ylabel("Water Depth (m)", fontsize=12)
-ax2.set_title("Water Depth Profile", fontsize=14, fontweight='bold')
+ax2.set_ylabel("Water Depth (m)", fontsize=12, color='cyan')
+ax2_twin.set_ylabel("Cumulative Flow (m)", fontsize=12, color='blue')
+ax2.set_title("Water Depth + Flow Profile", fontsize=14, fontweight='bold')
 ax2.grid(True, alpha=0.3)
-ax2.legend()
+ax2.tick_params(axis='y', labelcolor='cyan')
+ax2_twin.tick_params(axis='y', labelcolor='blue')
 
-# Highlight rivers and lakes
+# Highlight rivers (high flux areas)
 river_locs = np.where(rivers_mask[mid_row, :])[0]
-lake_locs = np.where(lakes_mask[mid_row, :])[0]
 if len(river_locs) > 0:
-    ax2.scatter(river_locs * pixel_scale_m, water_depth[mid_row, river_locs],
-                color='blue', s=30, zorder=10, label='Rivers', alpha=0.7)
-if len(lake_locs) > 0:
-    ax2.scatter(lake_locs * pixel_scale_m, water_depth[mid_row, lake_locs],
-                color='cyan', s=50, zorder=10, label='Lakes', alpha=0.7)
-ax2.legend()
+    ax2_twin.scatter(river_locs * pixel_scale_m, flux[mid_row, river_locs],
+                     color='darkblue', s=40, zorder=10, label='Rivers (flow)', alpha=0.8)
+    ax2_twin.legend(loc='upper right')
 
 plt.tight_layout()
 plt.show()
@@ -546,17 +517,23 @@ print(f"  Flow iterations: 300")
 print(f"  Final water depth:")
 print(f"    Max: {water_depth.max():.3f} m")
 print(f"    Mean: {water_depth.mean():.3f} m")
-print(f"  River cells: {num_river_cells} ({100*num_river_cells/(ny*nx):.2f}%)")
-print(f"  Lake cells: {num_lake_cells} ({100*num_lake_cells/(ny*nx):.2f}%)")
+print(f"  Cumulative flux (flow):")
+print(f"    Max: {flux.max():.2f} m")
+print(f"    Mean: {flux.mean():.2f} m")
+print(f"  Lakes (all settled water): {num_lake_cells} ({100*num_lake_cells/(ny*nx):.2f}%)")
+print(f"  Rivers (flow-based): {num_river_cells} ({100*num_river_cells/(ny*nx):.2f}%)")
 
 print("\n" + "="*80)
 print("✅ COMPLETE: EROSION + PROPER WATER FLOW")
 print("="*80)
-print("\nKey improvements:")
+print("\nKey features:")
 print("  ✓ Water tracked cell-by-cell (not discharge Q)")
 print("  ✓ Water flows to lowest neighbor iteratively")
-print("  ✓ Lakes = water with no downhill outlet")
-print("  ✓ Rivers = water with downhill neighbor")
+print("  ✓ Flux tracked: cumulative water that flowed through each cell")
+print("  ✓ Lakes = ALL settled water (where water ended up)")
+print("  ✓ Rivers = cells with high flux (water in motion)")
 print("  ✓ NO BLUE HUE - only water cells are colored")
 print("  ✓ Terrain stays normal colors where there's no water")
+print("  ✓ 'Rivers Only' shows flow map, not settled water")
+print("  ✓ 'Lakes Only' shows all settled water")
 print("="*80 + "\n")
