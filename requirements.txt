@@ -1,0 +1,15 @@
+# Landscape Evolution Simulator - Dependencies
+
+# Core scientific computing
+numpy>=1.20.0
+scipy>=1.7.0
+
+# Visualization
+matplotlib>=3.3.0
+
+# Optional but recommended for performance
+numba>=0.54.0
+
+# Optional: Quantum RNG support (if using quantum seeding)
+# qiskit>=0.30.0
+# qiskit-aer>=0.9.0
